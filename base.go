@@ -10,6 +10,4 @@ func InitConfig(configFile string) {
 	yamlParser.Parse()
 	Config = config.NewConfig(yamlParser)
 	Config.InitDbType().InitMysql().InitRedis()
-	MQInit()
-	RedisInit()
 }
