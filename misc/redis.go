@@ -1,4 +1,4 @@
-package common
+package misc
 
 import (
 	"fmt"
@@ -105,7 +105,7 @@ func InitRedis(isCluster ...bool) {
 }
 
 // Redis 获取Redis连接
-func Redis() redis.Conn {
+func GetRedis() redis.Conn {
 	addrs := strings.Split(Config.Redis.Addr, ",")
 	if len(addrs) == 1 {
 
@@ -123,7 +123,7 @@ func Redis() redis.Conn {
 }
 
 func UnLockUser(userId string, resLockKey string) error {
-	rs := Redis()
+	rs := GetRedis()
 	defer rs.Close()
 	userId1, err := redis.String(rs.Do("GET", resLockKey+":"+userId))
 	if err != nil {
@@ -139,7 +139,7 @@ func UnLockUser(userId string, resLockKey string) error {
 }
 
 func LockUser(userId string, resLockKey string) bool {
-	rs := Redis()
+	rs := GetRedis()
 	defer rs.Close()
 	res, _ := rs.Do("SET", resLockKey+":"+userId, userId, "EX", 10, "NX")
 	//fmt.Println("res.err:", res, err)
