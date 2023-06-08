@@ -10,6 +10,7 @@ type Config struct {
 	Web     *WebOptions
 	Redis   *RedisOptions
 	Service *ServiceOptions
+	AutoAutoMigrateTables []interface{}
 	parser  parser.Parser
 	DbType  string
 }
@@ -73,7 +74,7 @@ func (c *Config) InitMysql() *Config {
 }
 
 func (c *Config) InitRedis() {
-	addr := c.parser.GetString("redis", "addr")
+	addr := c.parser.GetString("redisServer", "addr")
 	maxidle := c.parser.GetString("redis", "maxidle")
 	maxactive := c.parser.GetString("redis", "maxactive")
 	maxidletimeout := c.parser.GetString("redis", "maxidletimeout")

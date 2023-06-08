@@ -1,4 +1,4 @@
-package common
+package misc
 
 import (
 	"github.com/lijianjunljj/gocommon/utils"
@@ -17,7 +17,7 @@ type TokenTool struct {
 // NewTokenService 实例化Token服务
 func NewTokenTool() *TokenTool {
 	return &TokenTool{
-		rs: Redis(),
+		rs: GetRedis(),
 	}
 }
 
