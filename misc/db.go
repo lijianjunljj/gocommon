@@ -27,3 +27,7 @@ func GetDB() *gorm.DB {
 	}
 	return DB.DB()
 }
+
+func SetAutoMigrateTables(tables []interface{})  {
+	Config.AutoAutoMigrateTables = tables
+}
