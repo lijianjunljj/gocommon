@@ -1,11 +1,11 @@
 package notify
 
 import (
-	"github.com/lijianjunljj/gocommon"
+	"github.com/lijianjunljj/gocommon/misc"
 )
 
 type TaskRequest struct {
-	common.Task
+	misc.Task
 	queueName string
 	args      map[string]interface{}
 }
@@ -18,7 +18,7 @@ func NewTaskRequest(...interface{}) *TaskRequest {
 	}
 }
 func (ai *TaskRequest) Produce(mqReq *NotifyResult) error {
-	mq := common.GetMQ()
+	mq := misc.GetMQ()
 
 	err := mq.Produce(ai.queueName, mqReq, ai.args)
 	return err
