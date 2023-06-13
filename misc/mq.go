@@ -13,18 +13,19 @@ import (
 var mqInstance *MQ
 
 type MQ struct {
-	con         *amqp.Connection
-	dsn         string
-	wg          *sync.WaitGroup
-	channel     *amqp.Channel
-	IsConnected bool
-	done        chan bool
+	con     *amqp.Connection
+	dsn     string
+	wg      *sync.WaitGroup
+	channel *amqp.Channel
+	done    chan bool
+	customers map[string]*RabbitMqCustomer
 	//Name        string
 	//args        map[string]interface{}
 	//queue       *amqp.Queue
 }
 
 func (m *MQ) init() {
+	m.customers = make(map[string]*RabbitMqCustomer)
 	m.wg = new(sync.WaitGroup)
 	m.dsn = m.getDSN()
 	m.connect()
@@ -34,27 +35,42 @@ func (m *MQ) init() {
 
 func (m *MQ) reconnect() {
 	defer m.wg.Done()
+	var gracefulValue *amqp.Error
 	graceful := make(chan *amqp.Error)
 	errs := m.channel.NotifyClose(graceful)
 	for {
 		select {
 		case <-m.done:
 			return
-		case <-graceful:
+		case gracefulValue = <-graceful:
+			if gracefulValue == nil {
+				break
+			}
+			fmt.Println("Graceful close!", gracefulValue)
 			graceful = make(chan *amqp.Error)
-			fmt.Println("Graceful close!")
-			m.IsConnected = false
-			m.connect()
-			m.IsConnected = true
+
+			err := m.connect()
+			for err != nil {
+				err = m.connect()
+			}
 			errs = m.channel.NotifyClose(graceful)
-		case <-errs:
+		case gracefulValue = <-errs:
+
+			if gracefulValue == nil {
+				break
+			}
+			fmt.Println("Graceful normal!", gracefulValue)
 			graceful = make(chan *amqp.Error)
-			logging.Error("Normal close")
-			m.IsConnected = false
-			m.connect()
+
+			err := m.connect()
+			for err != nil {
+				err = m.connect()
+			}
 			errs = m.channel.NotifyClose(graceful)
 		}
 	}
+
+	fmt.Println("reconnect finish")
 }
 
 func (m *MQ) getDSN() string {
@@ -71,8 +87,8 @@ func (m *MQ) getDSN() string {
 func (m *MQ) connect() (err error) {
 	m.con, err = amqp.Dial(m.dsn)
 	if err != nil {
-		logging.Error("rabbitmq 连接失败")
-		panic(err)
+		//logging.Error("rabbitmq 连接失败")
+		return err
 	} else {
 		logging.Debug("rabbitmq 连接成功")
 	}
@@ -81,7 +97,14 @@ func (m *MQ) connect() (err error) {
 		panic(err)
 	}
 	m.channel = ch
-	m.IsConnected = true
+
+	if len(m.customers) > 0 {
+		for _,v := range m.customers {
+			if v.IsStoped {
+				v.StartWork()
+			}
+		}
+	}
 	return err
 }
 
@@ -127,19 +150,17 @@ func (m *MQ) Produce(queueName string, req interface{}, args map[string]interfac
 	return nil
 }
 
-func (m *MQ) Consume(queueName string, f func(<-chan amqp.Delivery), autoAck bool, args map[string]interface{}) (err error) {
-	err, _ = m.QueueDeclare(queueName, args)
-	if err != nil {
-		return err
+func (m *MQ) Consume(queueName string, f func(<-chan amqp.Delivery,*RabbitMqCustomer), autoAck bool, args map[string]interface{}) (err error) {
+	fmt.Println("queueName..",queueName)
+	if _,Ok := m.customers[queueName];Ok {
+		if m.customers[queueName].IsStoped {
+			m.customers[queueName].StartWork()
+		}
+	}else{
+		customer := NewRabbitMqCustomer(queueName,m,queueName,f,autoAck,args)
+		m.customers[queueName] = customer
+		m.customers[queueName].StartWork()
 	}
-	fmt.Println("start custom 2222222222.", err)
-	msgs, err := m.channel.Consume(queueName, "", autoAck, false, false, false, nil)
-	if err != nil {
-		fmt.Println("Consume err: ", err)
-		panic(err)
-	}
-	// 处于一个监听状态，一致监听我们的生产端的生产，所以这里我们要阻塞主进程
-	f(msgs)
 	return err
 }
 
@@ -159,4 +180,44 @@ func MQInit() {
 	} else {
 		panic(errors.New("mq配置未初始化"))
 	}
+}
+
+
+
+type RabbitMqCustomer struct {
+	id string
+	m         *MQ
+	queueName string
+	workFunc  func(<-chan amqp.Delivery,*RabbitMqCustomer)
+	autoAck   bool
+	IsStoped  bool
+	args      map[string]interface{}
+}
+
+func NewRabbitMqCustomer(id string ,m *MQ,queueName string, f func(<-chan amqp.Delivery,*RabbitMqCustomer), autoAck bool, args map[string]interface{}) *RabbitMqCustomer {
+	return &RabbitMqCustomer{
+		id :id,
+		m:m,
+		queueName: queueName,
+		workFunc: f,
+		autoAck: autoAck,
+		args: args,
+	}
+}
+func (that *RabbitMqCustomer) StartWork() error  {
+	err, _ := that.m.QueueDeclare(that.queueName, that.args)
+	if err != nil {
+		return err
+	}
+	fmt.Println("start custom 2222222222.", err)
+	msgs, err := that.m.channel.Consume(that.queueName, "", that.autoAck, false, false, false, nil)
+	if err != nil {
+		fmt.Println("Consume err: ", err)
+		panic(err)
+	}
+	that.IsStoped = false
+	// 处于一个监听状态，一致监听我们的生产端的生产，所以这里我们要阻塞主进程
+	fmt.Println("消费者启动",that.id)
+	that.workFunc(msgs,that)
+	return err
 }
