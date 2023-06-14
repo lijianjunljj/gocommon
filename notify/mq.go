@@ -7,8 +7,7 @@ const (
 type NotifyResult struct {
 	UserId   string      `json:"user_id"`
 	TaskId   interface{} `json:"task_id"`
-	DistUrl  string      `json:"dist_url"`
-	DistText string      `json:"dist_text"`
+	Data interface{} `json:"data"`
 }
 
 type NotifyChatgptResult struct {
