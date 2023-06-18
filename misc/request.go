@@ -1,4 +1,4 @@
-package utils
+package misc
 
 import (
 	"crypto/tls"
@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"strings"
 	"time"
-	"github.com/lijianjunljj/gocommon/misc"
 	"github.com/gin-gonic/gin"
 )
 
@@ -21,18 +20,6 @@ type Request struct {
 	Headers map[string]string
 }
 
-const (
-	//RequestTimeout 连接超时时间，默认5秒超时时间
-	RequestTimeout = misc.RequestTimeout
-	//RequestIsTracing 是否开启HTTP请求链路追踪
-	RequestIsTracing = misc.RequestIsTracing
-	//ResponseCode 请求响应代码字段名
-	ResponseCode = misc.ResponseCode
-	//ResponseMsg 请求响应代码字段名
-	ResponseMsg = misc.ResponseMsg
-	//ResponseData 请求响应代码字段名
-	ResponseData = misc.ResponseData
-)
 
 //POST POST请求
 func POST(url string, data interface{}, ctxs ...*gin.Context) (map[string]interface{}, error) {
@@ -80,11 +67,12 @@ func HTTPRequest(request Request, isAllResponse bool, ctxs []*gin.Context) (map[
 	var err error
 	switch v := request.Data.(type) {
 	case *map[string]interface{}:
-		data, err = JSONEncode(request.Data)
+		bytes, err := json.Marshal(request.Data)
 		fmt.Println("request JSONEncode err:", err)
 		if err != nil {
 			return resData, err
 		}
+		data = string(bytes)
 	case string:
 		data = v
 		//fmt.Println("request data type:", v)
@@ -133,7 +121,7 @@ func HTTPRequest(request Request, isAllResponse bool, ctxs []*gin.Context) (map[
 	if isAllResponse {
 		return resData, nil
 	}
-	if resData[ResponseCode] != misc.CodeSuccess {
+	if resData[ResponseCode] != CodeSuccess {
 		return empty, errors.New(resData[ResponseMsg].(string))
 	}
 	if resData[ResponseData] == nil {
