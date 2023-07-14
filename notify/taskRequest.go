@@ -10,10 +10,10 @@ type TaskRequest struct {
 	args      map[string]interface{}
 }
 
-func NewTaskRequest(...interface{}) *TaskRequest {
+func NewTaskRequest(mqprefix string) *TaskRequest {
 	args := map[string]interface{}{"x-message-ttl": 10000}
 	return &TaskRequest{
-		queueName: QUEUE_NAME_NOTIFY_RESULT,
+		queueName: mqprefix+QUEUE_NAME_NOTIFY_RESULT,
 		args:      args,
 	}
 }
