@@ -6,6 +6,9 @@ import (
 	"io/ioutil"
 	"net/http"
 	"time"
+	"strconv"
+	"mime/multipart"
+	"io"
 )
 
 //ResponseWrapper 响应结构体
@@ -92,4 +95,56 @@ func setRequestHeader(req *http.Request) {
 func createRequestError(err error) ResponseWrapper {
 	errorMessage := fmt.Sprintf("创建HTTP请求错误-%s", err.Error())
 	return ResponseWrapper{0, errorMessage, make(http.Header)}
+}
+
+type HttpFile struct {
+	fileName string
+	fileBuff []byte
+}
+func createReqBody(params map[string]string,files []HttpFile) (string, io.Reader, error) {
+	var err error
+
+	buf := new(bytes.Buffer)
+	bw := multipart.NewWriter(buf) // body writer
+	for k,v := range params{
+		p1w, err := bw.CreateFormField(k)
+		if err != nil {
+			return "", nil, err
+		}
+		p1w.Write([]byte(v))
+	}
+
+
+	for k,v := range files {
+		f := bytes.NewReader(v.fileBuff)
+		fw1, err := bw.CreateFormFile("file"+strconv.Itoa(k), v.fileName)
+		if err != nil {
+			return "", nil, err
+		}
+		io.Copy(fw1, f)
+	}
+	bw.Close()
+	return bw.FormDataContentType(), buf, err
+}
+
+func PostUpload(url string, params map[string]string,files []HttpFile) error {
+	// create body
+	contType, reader, err := createReqBody(params,files)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", url, reader)
+
+	// add headers
+	req.Header.Add("Content-Type", contType)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Println("request send error:", err)
+		return err
+	}
+	resp.Body.Close()
+	return nil
 }
