@@ -7,6 +7,7 @@ const (
 type NotifyResult struct {
 	UserId   string      `json:"user_id"`
 	TaskId   interface{} `json:"task_id"`
+	Type int8 `json:"type"`
 	Data interface{} `json:"data"`
 }
 

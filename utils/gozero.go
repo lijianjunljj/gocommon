@@ -5,11 +5,11 @@ import (
 	"github.com/zeromicro/go-zero/core/discov"
 	"fmt"
 )
-func ZrpcConnDirect(dsn string) zrpc.Client  {
+func ZrpcConnDirect(dsn string,options ...zrpc.ClientOption) zrpc.Client  {
 	conn := zrpc.MustNewClient(zrpc.RpcClientConf{
 		Target: dsn,
 		NonBlock: true,
-	})
+	},options...)
 	return conn
 }
 

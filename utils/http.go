@@ -98,8 +98,8 @@ func createRequestError(err error) ResponseWrapper {
 }
 
 type HttpFile struct {
-	fileName string
-	fileBuff []byte
+	FileName string
+	FileBuff []byte
 }
 func createReqBody(params map[string]string,files []HttpFile) (string, io.Reader, error) {
 	var err error
@@ -116,8 +116,8 @@ func createReqBody(params map[string]string,files []HttpFile) (string, io.Reader
 
 
 	for k,v := range files {
-		f := bytes.NewReader(v.fileBuff)
-		fw1, err := bw.CreateFormFile("file"+strconv.Itoa(k), v.fileName)
+		f := bytes.NewReader(v.FileBuff)
+		fw1, err := bw.CreateFormFile("file"+strconv.Itoa(k), v.FileName)
 		if err != nil {
 			return "", nil, err
 		}
