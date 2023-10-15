@@ -12,7 +12,15 @@ func ZrpcConnDirect(dsn string,options ...zrpc.ClientOption) zrpc.Client  {
 	},options...)
 	return conn
 }
-
+func ZrpcAuthConnDirect(dsn,app,token string,options ...zrpc.ClientOption) zrpc.Client  {
+	conn := zrpc.MustNewClient(zrpc.RpcClientConf{
+		Target: dsn,
+		NonBlock: true,
+		App: app,
+		Token: token,
+	},options...)
+	return conn
+}
 func ZrpcConn(serviceName string,option ...interface{}) zrpc.Client  {
 	var dsn,user,pass string
 	if len(option) > 0  {
