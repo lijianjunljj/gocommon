@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"github.com/lijianjunljj/gocommon/config"
 	commonLoger "github.com/lijianjunljj/gocommon/loger"
-	"github.com/lijianjunljj/gocommon/utils"
+	//"github.com/lijianjunljj/gocommon/utils"
 	gormMysql "gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	gormLogger "gorm.io/gorm/logger"
@@ -27,7 +27,7 @@ func (my *Mysql) Connect() *gorm.DB {
 	maxidleconns := my.config.MysqlMaxIdleCons
 	lifeTime := my.config.MysqlLifeTimeout
 	fmt.Println(timeout, maxopenconns, maxidleconns, lifeTime)
-	var link = my.config.DbUser + ":" + my.config.DbPassWord + "@tcp(" + my.config.DbHost + ":" + my.config.DbPort + ")/" + my.config.DbName + "?charset=utf8&parseTime=True&loc=Local&interpolateParams=true&timeout=" + timeout
+	var link = my.config.DbUser + ":" + my.config.DbPassWord + "@tcp(" + my.config.DbHost + ":" + my.config.DbPort + ")/" + my.config.DbName + "?charset=utf8mb4&parseTime=True&loc=Local&interpolateParams=true&timeout=" + timeout
 	fmt.Println(link)
 	comLoger, _ := commonLoger.NewLoger("", log.LstdFlags, func() string {
 		now := time.Now()
@@ -44,6 +44,7 @@ func (my *Mysql) Connect() *gorm.DB {
 	newLogger := gormLogger.New(
 		log.New(comLoger.Writer(), "\r\n", log.LstdFlags), // io writer)
 		gormLogger.Config{
+			IgnoreRecordNotFoundError:true,
 			SlowThreshold: 200000 * time.Microsecond, // 慢 SQL 阈值
 			LogLevel:      gormLogger.Warn,           // Log level
 			Colorful:      true,                      // 禁用彩色打印
@@ -51,7 +52,7 @@ func (my *Mysql) Connect() *gorm.DB {
 	)
 
 	db, err := gorm.Open(gormMysql.Open(link), &gorm.Config{
-		DisableAutomaticPing:                     true,
+		DisableAutomaticPing:                     false,
 		DisableForeignKeyConstraintWhenMigrating: true,
 		SkipDefaultTransaction:                   true,
 		PrepareStmt:                              true,
@@ -68,27 +69,26 @@ func (my *Mysql) Connect() *gorm.DB {
 	return db
 }
 func (my *Mysql) DB() *gorm.DB {
-	t1 := utils.TimeMilliUnix()
+	//t1 := utils.TimeMilliUnix()
 	if my.MysqlDB == nil {
 		fmt.Println("初始化mysql连接！")
 		my.Connect()
 	}
-	sqlDB, err := my.MysqlDB.DB()
-	if err != nil {
-		fmt.Println("连接mysql失败，重新连接！")
-		my.Connect()
-	}
+	//sqlDB, err := my.MysqlDB.DB()
+	//if err != nil {
+	//	fmt.Println("连接mysql失败，重新连接！")
+	//	my.Connect()
+	//}
 
-	err = sqlDB.Ping()
-	fmt.Println("mysql status:", sqlDB.Stats())
-	if err != nil {
-
-		fmt.Println("ping失败,数据库重连")
-		sqlDB.Close()
-		my.Connect()
-	}
-	t2 := utils.TimeMilliUnix()
-	fmt.Println("use time:", t2-t1)
+	//err = sqlDB.Ping()
+	//fmt.Println("mysql status:", sqlDB.Stats())
+	//if err != nil {
+	//	fmt.Println("ping失败,数据库重连",err)
+	//	sqlDB.Close()
+	//	my.Connect()
+	//}
+	//t2 := utils.TimeMilliUnix()
+	//fmt.Println("use time:", t2-t1)
 	return my.MysqlDB
 }
 
