@@ -5,6 +5,7 @@ import (
 	"github.com/lijianjunljj/gocommon/utils"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -175,13 +176,26 @@ func (l *Logic) Detail(extras ...Extra) error {
 
 // Delete 删除
 func (l *Logic) Delete(str string, extras ...Extra) error {
+	modelTypes := reflect.TypeOf(l.svc.Model).Elem()
+	id, _ := modelTypes.FieldByName("ID")
 	ids := StrToSlice(str)
 	if len(ids) == 0 {
 		return errors.New("ID不能为空")
 	}
 	for _, item := range ids {
 		mv := reflect.ValueOf(l.svc.Model).Elem()
-		mv.FieldByName("ID").SetString(item)
+		switch id.Type.String() {
+		case "string":
+			mv.FieldByName("ID").SetString(item)
+			break
+		case "uint64":
+			parseInt, _ := strconv.ParseInt(item, 10, 64)
+			mv.FieldByName("ID").SetUint(uint64(parseInt))
+			break
+		default:
+			break
+		}
+
 		err := l.svc.API.Delete(l.svc.Model)
 		if err != nil {
 			return err
