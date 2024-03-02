@@ -139,8 +139,24 @@ func (l *Logic) Add(userID string, extras ...Extra) error {
 // Edit 修改
 func (l *Logic) Edit(extras ...Extra) error {
 	mv := reflect.ValueOf(l.svc.Model).Elem()
-	if ID := mv.FieldByName("ID").Interface().(string); ID == "" {
-		return errors.New("ID不能为空")
+
+	modelTypes := reflect.TypeOf(l.svc.Model).Elem()
+
+	id, _ := modelTypes.FieldByName("ID")
+	switch id.Type.String() {
+	case "string":
+		if ID := mv.FieldByName("ID").Interface().(string); ID == "" {
+			return errors.New("ID不能为空")
+		}
+		break
+	case "uint64":
+		if ID := mv.FieldByName("ID").Interface().(uint64); ID == 0 {
+			return errors.New("ID不能为空")
+		}
+		break
+
+	default:
+		break
 	}
 	extraNum := len(extras)
 	if extraNum > 0 {
@@ -164,9 +180,26 @@ func (l *Logic) Edit(extras ...Extra) error {
 // Detail 详情
 func (l *Logic) Detail(extras ...Extra) error {
 	mv := reflect.ValueOf(l.svc.Model).Elem()
-	if ID := mv.FieldByName("ID").Interface().(string); ID == "" {
-		return errors.New("ID不能为空")
+
+	modelTypes := reflect.TypeOf(l.svc.Model).Elem()
+
+	id, _ := modelTypes.FieldByName("ID")
+	switch id.Type.String() {
+	case "string":
+		if ID := mv.FieldByName("ID").Interface().(string); ID == "" {
+			return errors.New("ID不能为空")
+		}
+		break
+	case "uint64":
+		if ID := mv.FieldByName("ID").Interface().(uint64); ID == 0 {
+			return errors.New("ID不能为空")
+		}
+		break
+
+	default:
+		break
 	}
+
 	err := l.svc.API.Detail(l.svc.Model)
 	for _, extra := range extras {
 		extra(l.svc.Model)
