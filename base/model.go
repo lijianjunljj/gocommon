@@ -4,8 +4,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
-	util2 "game_server/lib/util"
-	"game_server/suffer/curd/common/util"
+	"github.com/lijianjunljj/gocommon/utils"
 	"reflect"
 
 	"gorm.io/gorm"
@@ -63,14 +62,17 @@ func StrToSlice(str string) []string {
 	str = strings.ReplaceAll(str, "]", "")
 	return strings.Split(str, ",")
 }
+func (m *Model) Mysql() *gorm.DB {
+	return nil
+}
 
 // Query 解析参数链式查询
 func (m *Model) Query(search *Search, isHook bool, model interface{}, isPages bool) (int64, error) {
 	var count int64
-	db := util.Mysql().Model(model)
+	db := m.Mysql().Model(model)
 	for key, value := range search.Search {
-		fieldName := util2.CamelToLine(key)
-		str := util2.ToStr(value)
+		fieldName := utils.CamelToLine(key)
+		str := utils.ToStr(value)
 		tp := reflect.TypeOf(value)
 		if key == "deadline" {
 			db = db.Where("deadline > ?", str)
@@ -120,24 +122,24 @@ func (m *Model) All(search *Search, isHook bool, models interface{}) error {
 
 // Detail 通用详情查询
 func (m *Model) Detail(model interface{}) error {
-	result := util.Mysql().Find(model, m.ID)
+	result := m.Mysql().Find(model, m.ID)
 	return result.Error
 }
 
 // Add 通用新增功能
 func (m *Model) Add(model interface{}) error {
-	result := util.Mysql().Omit(clause.Associations).Create(model)
+	result := m.Mysql().Omit(clause.Associations).Create(model)
 	return result.Error
 }
 
 // Edit 通用编辑功能
 func (m *Model) Edit(model interface{}) error {
-	result := util.Mysql().Omit(clause.Associations).Save(model)
+	result := m.Mysql().Omit(clause.Associations).Save(model)
 	return result.Error
 }
 
 // Delete 通用删除功能
 func (m *Model) Delete(model interface{}) error {
-	result := util.Mysql().Delete(model)
+	result := m.Mysql().Delete(model)
 	return result.Error
 }
