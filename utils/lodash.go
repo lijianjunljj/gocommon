@@ -10,6 +10,7 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"net/url"
 	"os"
 	"path"
 	"reflect"
@@ -24,21 +25,21 @@ import (
 	uuid "github.com/satori/go.uuid"
 )
 
-//Md5 将字符串进行MD5加密
+// Md5 将字符串进行MD5加密
 func Md5(str string) string {
 	b := []byte(str)
 	s := fmt.Sprintf("%x", md5.Sum(b))
 	return s
 }
 
-//UUID 生成UUID字符串
+// UUID 生成UUID字符串
 func UUID() string {
 	s := uuid.Must(uuid.NewV4(), nil).String()
 	// s = strings.Replace(s, "-", "", -1)
 	return s
 }
 
-//Password 两次MD5加密生成密码
+// Password 两次MD5加密生成密码
 func Password(str string) string {
 	if len(str) == 0 {
 		return ""
@@ -46,7 +47,7 @@ func Password(str string) string {
 	return Md5(Md5(str))
 }
 
-//Capitalize 首字母大写
+// Capitalize 首字母大写
 func Capitalize(str string) string {
 	if len(str) < 1 {
 		return ""
@@ -58,7 +59,7 @@ func Capitalize(str string) string {
 	return string(strArr)
 }
 
-//FirstToLower 首字母小写
+// FirstToLower 首字母小写
 func FirstToLower(str string) string {
 	if len(str) < 1 {
 		return ""
@@ -70,7 +71,7 @@ func FirstToLower(str string) string {
 	return string(strArr)
 }
 
-//FirstLetter 首字母
+// FirstLetter 首字母
 func FirstLetter(str string) string {
 	if len(str) < 1 {
 		return ""
@@ -82,7 +83,7 @@ func FirstLetter(str string) string {
 	return string(strArr[0])
 }
 
-//Bind 绑定入参到结构体或者MAP,object为指针
+// Bind 绑定入参到结构体或者MAP,object为指针
 func Bind(ctx *gin.Context, object interface{}) (interface{}, error) {
 	bindType := binding.Default(ctx.Request.Method, ctx.ContentType())
 	if err := ctx.ShouldBindWith(object, bindType); err != nil {
@@ -91,7 +92,7 @@ func Bind(ctx *gin.Context, object interface{}) (interface{}, error) {
 	return object, nil
 }
 
-//Invoke 传入函数和参数调用函数返回函数执行结果
+// Invoke 传入函数和参数调用函数返回函数执行结果
 func Invoke(f interface{}, params ...interface{}) []reflect.Value {
 	fv := reflect.ValueOf(f)
 	realParams := make([]reflect.Value, len(params))
@@ -102,7 +103,7 @@ func Invoke(f interface{}, params ...interface{}) []reflect.Value {
 	return rs
 }
 
-//Getenv 获取ENV环境变量
+// Getenv 获取ENV环境变量
 func Getenv() string {
 	env := os.Getenv("ENV")
 	if env == "" {
@@ -111,7 +112,7 @@ func Getenv() string {
 	return env
 }
 
-//IsEmpty 判断变量是否为空
+// IsEmpty 判断变量是否为空
 func IsEmpty(val interface{}) bool {
 	if val == nil {
 		return true
@@ -137,18 +138,18 @@ func IsEmpty(val interface{}) bool {
 	return reflect.DeepEqual(val, reflect.Zero(v.Type()).Interface())
 }
 
-//Base64Encode 字符串转base64编码
+// Base64Encode 字符串转base64编码
 func Base64Encode(s string) string {
 	return base64.StdEncoding.EncodeToString([]byte(s))
 }
 
-//Base64Decode base64编码转字符串
+// Base64Decode base64编码转字符串
 func Base64Decode(s string) (string, error) {
 	ds, err := base64.StdEncoding.DecodeString(s)
 	return string(ds), err
 }
 
-//JSONEncode MAP/结构体转JSON字符串
+// JSONEncode MAP/结构体转JSON字符串
 func JSONEncode(v interface{}) (string, error) {
 	bytes, err := json.Marshal(v)
 	if err != nil {
@@ -157,19 +158,19 @@ func JSONEncode(v interface{}) (string, error) {
 	return string(bytes), nil
 }
 
-//JSONDecode JSON字符串转结构体/MAP
+// JSONDecode JSON字符串转结构体/MAP
 func JSONDecode(data []byte, val interface{}) error {
 	return json.Unmarshal(data, val)
 }
 
-//FloatFixed 小数点后 n 位四舍五入
+// FloatFixed 小数点后 n 位四舍五入
 func FloatFixed(val float64, n int) float64 {
 	shift := math.Pow(10, float64(n))
 	fv := 0.0000000001 + val //对浮点数产生.xxx999999999 计算不准进行处理
 	return math.Floor(fv*shift+.5) / shift
 }
 
-//FloatRound 小数点后 n 位舍去
+// FloatRound 小数点后 n 位舍去
 func FloatRound(val float64, n int) float64 {
 	floatStr := fmt.Sprintf("%."+strconv.Itoa(n+1)+"f", val)
 	temp := strings.Split(floatStr, ".")
@@ -183,19 +184,19 @@ func FloatRound(val float64, n int) float64 {
 	return inst
 }
 
-//ParseYAML 从YAML配置文件中获取配置对象
+// ParseYAML 从YAML配置文件中获取配置对象
 func ParseYAML(filepath string) (*config.Config, error) {
 	cfg, err := config.ParseYamlFile(filepath)
 	return cfg, err
 }
 
-//ParseJSON 从JSON配置文件中获取配置对象
+// ParseJSON 从JSON配置文件中获取配置对象
 func ParseJSON(filepath string) (*config.Config, error) {
 	cfg, err := config.ParseJsonFile(filepath)
 	return cfg, err
 }
 
-//GetIP 获取本地IP地址
+// GetIP 获取本地IP地址
 func GetIP() (string, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
@@ -223,7 +224,7 @@ func GetIP() (string, error) {
 	return "", errors.New("connected to the network?")
 }
 
-//GetIPFromAddr 从地址信息中获取IP
+// GetIPFromAddr 从地址信息中获取IP
 func GetIPFromAddr(addr net.Addr) net.IP {
 	var ip net.IP
 	switch v := addr.(type) {
@@ -242,8 +243,18 @@ func GetIPFromAddr(addr net.Addr) net.IP {
 
 	return ip
 }
+func UrlEncode(str string) string {
+	return url.QueryEscape(str)
+}
+func UrlDecode(str string) string {
+	res, err := url.QueryUnescape(str)
+	if err != nil {
+		return ""
+	}
+	return res
+}
 
-//JoinURL 连接网址
+// JoinURL 连接网址
 func JoinURL(urls ...string) string {
 	url := ""
 	for _, val := range urls {
@@ -252,7 +263,7 @@ func JoinURL(urls ...string) string {
 	return strings.Replace(url, ":/", "://", 1)
 }
 
-//GenCode 生成N位随机数字字符串
+// GenCode 生成N位随机数字字符串
 func GenCode(width int) string {
 	rand.Seed(time.Now().UnixNano())
 	var result strings.Builder
@@ -262,7 +273,7 @@ func GenCode(width int) string {
 	return result.String()
 }
 
-//GenStr 生成N位随机字符串
+// GenStr 生成N位随机字符串
 func GenStr(width int) string {
 	r := rand.New(rand.NewSource(time.Now().Unix()))
 	bytes := make([]byte, width)
@@ -273,7 +284,7 @@ func GenStr(width int) string {
 	return string(bytes)
 }
 
-//PanicToError Panic转换为error
+// PanicToError Panic转换为error
 func PanicToError(f func()) (err error) {
 	defer func() {
 		if e := recover(); e != nil {
@@ -284,7 +295,7 @@ func PanicToError(f func()) (err error) {
 	return
 }
 
-//PanicTrace panic调用链跟踪
+// PanicTrace panic调用链跟踪
 func PanicTrace(err interface{}) string {
 	stackBuf := make([]byte, 4096)
 	n := runtime.Stack(stackBuf, false)
@@ -292,7 +303,7 @@ func PanicTrace(err interface{}) string {
 	return fmt.Sprintf("panic: %v %s", err, stackBuf[:n])
 }
 
-//InStringSlice 判断字符串是否在切片中
+// InStringSlice 判断字符串是否在切片中
 func InStringSlice(slice []string, element string) bool {
 	element = strings.TrimSpace(element)
 	for _, v := range slice {
@@ -304,7 +315,7 @@ func InStringSlice(slice []string, element string) bool {
 	return false
 }
 
-//CurrentPath 当前路径
+// CurrentPath 当前路径
 func CurrentPath() string {
 	dir, err := os.Getwd()
 	if err != nil {
@@ -313,7 +324,7 @@ func CurrentPath() string {
 	return strings.Replace(dir, "\\", "/", -1)
 }
 
-//RetryTimes 重试
+// RetryTimes 重试
 func RetryTimes(tryTimes int, sleep time.Duration, callback func() error) (err error) {
 	for i := 1; i <= tryTimes; i++ {
 		err = callback()
@@ -325,7 +336,7 @@ func RetryTimes(tryTimes int, sleep time.Duration, callback func() error) (err e
 	return err
 }
 
-//RandPicker 随机取N个值
+// RandPicker 随机取N个值
 func RandPicker(origin []string, count int) []string {
 	tmpOrigin := make([]string, len(origin))
 	copy(tmpOrigin, origin)
@@ -344,13 +355,13 @@ func RandPicker(origin []string, count int) []string {
 	return result
 }
 
-//Decimal 64位浮点数保留2位小数
+// Decimal 64位浮点数保留2位小数
 func Decimal(value float64) float64 {
 	value, _ = strconv.ParseFloat(fmt.Sprintf("%.2f", value), 64)
 	return value
 }
 
-//Sum 求和
+// Sum 求和
 func Sum(results []float64) float64 {
 	var sum float64
 	for _, v := range results {
