@@ -1,9 +1,8 @@
 package base
 
 import (
-	"github.com/lijianjunljj/gocommon/sn/client"
-
 	"github.com/gin-gonic/gin"
+	"github.com/lijianjunljj/gocommon/sn/client"
 )
 
 // API 服务

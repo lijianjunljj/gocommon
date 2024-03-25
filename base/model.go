@@ -9,9 +9,14 @@ import (
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
-
 	"strings"
 )
+
+var mysql func() *gorm.DB
+
+func WithMysql(mysqlFunc func() *gorm.DB) {
+	mysql = mysqlFunc
+}
 
 // Search 搜索结构模型
 type Search struct {
@@ -29,6 +34,7 @@ type Model struct {
 	CreateTime int64  `json:"create_time"`
 	UpdateTime int64  `json:"update_time"`
 	IsChanged  int8   `json:"is_changed" gorm:"type:tinyint(4) DEFAULT 0"`
+	mysql      func() *gorm.DB
 }
 
 type ModelIdInt struct {
@@ -62,14 +68,11 @@ func StrToSlice(str string) []string {
 	str = strings.ReplaceAll(str, "]", "")
 	return strings.Split(str, ",")
 }
-func (m *Model) Mysql() *gorm.DB {
-	return nil
-}
 
 // Query 解析参数链式查询
 func (m *Model) Query(search *Search, isHook bool, model interface{}, isPages bool) (int64, error) {
 	var count int64
-	db := m.Mysql().Model(model)
+	db := mysql().Model(model)
 	for key, value := range search.Search {
 		fieldName := utils.CamelToLine(key)
 		str := utils.ToStr(value)
@@ -122,24 +125,24 @@ func (m *Model) All(search *Search, isHook bool, models interface{}) error {
 
 // Detail 通用详情查询
 func (m *Model) Detail(model interface{}) error {
-	result := m.Mysql().Find(model, m.ID)
+	result := mysql().Find(model, m.ID)
 	return result.Error
 }
 
 // Add 通用新增功能
 func (m *Model) Add(model interface{}) error {
-	result := m.Mysql().Omit(clause.Associations).Create(model)
+	result := mysql().Omit(clause.Associations).Create(model)
 	return result.Error
 }
 
 // Edit 通用编辑功能
 func (m *Model) Edit(model interface{}) error {
-	result := m.Mysql().Omit(clause.Associations).Save(model)
+	result := mysql().Omit(clause.Associations).Save(model)
 	return result.Error
 }
 
 // Delete 通用删除功能
 func (m *Model) Delete(model interface{}) error {
-	result := m.Mysql().Delete(model)
+	result := mysql().Delete(model)
 	return result.Error
 }

@@ -14,7 +14,7 @@ import (
 	"github.com/disintegration/imaging"
 )
 
-const (
+var (
 	//FileUploadFormat 文件上传按时间划分目录的时间格式
 	FileUploadFormat = "200601"
 	//FileUploadRoot 文件上传根目录名
@@ -22,16 +22,15 @@ const (
 	//FileUploadThumb 文件上传图片缩略图存储目录名
 	FileUploadThumb = "thumbnails"
 	//301重定向CDN地址 使用301重定向 2022-04-28
-	FileUrlOfCDN = "https://file.aixns.com/file/"
 )
 
-//FileExt 从文件地址获取文件的后缀
+// FileExt 从文件地址获取文件的后缀
 func FileExt(name string) string {
 	names := strings.Split(name, ".")
 	return "." + names[len(names)-1]
 }
 
-//IsExist 检查文件目录是否已存在,不存在就创建
+// IsExist 检查文件目录是否已存在,不存在就创建
 func IsExist(path string) (bool, error) {
 	_, err := os.Stat(path)
 	if err != nil {
@@ -47,7 +46,7 @@ func IsExist(path string) (bool, error) {
 	return true, nil
 }
 
-//IsPathExist 检查文件目录是否已存在
+// IsPathExist 检查文件目录是否已存在
 func IsPathExist(path string) bool {
 	_, err := os.Stat(path)
 	if err != nil {
@@ -56,7 +55,7 @@ func IsPathExist(path string) bool {
 	return true
 }
 
-//FileURL 根据传入的目录与文件名生成文件路径和相对URL地址
+// FileURL 根据传入的目录与文件名生成文件路径和相对URL地址
 func FileURL(access string, filename string) (string, string, error) {
 	getwd, _ := os.Getwd()
 	month := time.Now().Format(FileUploadFormat)
@@ -67,7 +66,7 @@ func FileURL(access string, filename string) (string, string, error) {
 	return filepath.Join(path, filename), url, err
 }
 
-//ThumbURL 根据传入的文件路径，文件名，宽度,高度生成缩略图，缩略图存储到常量设置的目录中，返回缩略图的URL地址
+// ThumbURL 根据传入的文件路径，文件名，宽度,高度生成缩略图，缩略图存储到常量设置的目录中，返回缩略图的URL地址
 func ThumbURL(filepath string, filename string, width int, height int) (string, error) {
 	var parseURL string
 	if width == 0 {
@@ -92,7 +91,7 @@ func ThumbURL(filepath string, filename string, width int, height int) (string, 
 
 }
 
-//ThumbStream 生成缩略图流
+// ThumbStream 生成缩略图流
 func ThumbStream(reader io.Reader, width int, height int) (*image.NRGBA, error) {
 	if width == 0 {
 		width = 300
@@ -111,7 +110,7 @@ func ThumbStream(reader io.Reader, width int, height int) (*image.NRGBA, error) 
 
 }
 
-//ThumbStreamByPath 生成缩略图流
+// ThumbStreamByPath 生成缩略图流
 func ThumbStreamByPath(filepath string, width int, height int) (*image.NRGBA, error) {
 	if width == 0 {
 		width = 300
@@ -130,7 +129,7 @@ func ThumbStreamByPath(filepath string, width int, height int) (*image.NRGBA, er
 
 }
 
-//ChunkURL 根据传入的目录名，文件md5标识，分片序号返回分片的路径，分片存储目录地址
+// ChunkURL 根据传入的目录名，文件md5标识，分片序号返回分片的路径，分片存储目录地址
 func ChunkURL(access string, identifier string, chunkNumber int) (string, string, error) {
 	getwd, _ := os.Getwd()
 	path := filepath.Join(getwd, FileUploadRoot, access, identifier)
@@ -138,7 +137,7 @@ func ChunkURL(access string, identifier string, chunkNumber int) (string, string
 	return filepath.Join(path, strconv.Itoa(chunkNumber)), path, err
 }
 
-//WriteFile 往文件中写入数据
+// WriteFile 往文件中写入数据
 func WriteFile(filename string, data []byte) error {
 	f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
@@ -151,7 +150,7 @@ func WriteFile(filename string, data []byte) error {
 	return err
 }
 
-//CreateIfNotExist 创建文件
+// CreateIfNotExist 创建文件
 func CreateIfNotExist(file string) (*os.File, error) {
 	_, err := os.Stat(file)
 	if !os.IsNotExist(err) {
