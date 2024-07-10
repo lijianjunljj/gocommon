@@ -2,6 +2,13 @@ package utils
 
 import "fmt"
 
+func GenerateSequence(n int) []int {
+	sequence := []int{}
+	for i := 1; i <= n; i++ {
+		sequence = append(sequence, i)
+	}
+	return sequence
+}
 // 全排列
 func Permute[T any](nums []T) [][]T {
 	var results [][]T
