@@ -10,7 +10,7 @@ import (
 var (
 	//LogSavePath = "runtime/logs/"
 	LogSavePath = ""
-	LogSaveName = "log"
+	LogSaveName = ""
 	LogFileExt  = "log"
 	TimeFormat  = "20060102"
 )

@@ -6,19 +6,50 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
+	"time"
 )
+
+type FileMgr struct {
+	files map[*os.File]struct{}
+	lock  sync.Mutex
+}
+
+func (f *FileMgr) Init() {
+	f.files = make(map[*os.File]struct{})
+}
+func (f *FileMgr) AddFile(file *os.File) {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	f.files[file] = struct{}{}
+}
+
+func (f *FileMgr) Collect() {
+	Debug("start connect....", len(f.files))
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	for k, _ := range f.files {
+		err := k.Close()
+		if err == nil {
+			delete(f.files, k)
+		}
+	}
+	Debug("end connect....", len(f.files))
+}
 
 type Level int
 
 var (
-	F *os.File
+	F       *os.File
+	fileMgr FileMgr
 
 	DefaultPrefix      = ""
 	DefaultCallerDepth = 2
 
-	logger     *log.Logger
-	logPrefix  = ""
-	levelFlags = []string{"DEBUG", "INFO", "WARN", "ERROR", "FATAL"}
+	logger      *log.Logger
+	logPrefix   = ""
+	levelFlags  = []string{"DEBUG", "INFO", "WARN", "ERROR", "FATAL"}
+	logFilePath = ""
 )
 
 const (
@@ -29,14 +60,51 @@ const (
 	FATAL
 )
 
-func init() {
+func Init(conf *Config) {
+	fileMgr.Init()
+	LogSavePath = conf.SavePath
+	LogSaveName = conf.SaveName
+	LogFileExt = conf.FileExt
+	TimeFormat = conf.Format
 	if LogSavePath == "" {
 		logger = log.New(os.Stdout, "", log.LstdFlags)
 	} else {
-		filePath := getLogFileFullPath()
-		F = openLogFile(filePath)
+		logFilePath = getLogFileFullPath()
+		F = openLogFile(logFilePath)
 		logger = log.New(F, DefaultPrefix, log.LstdFlags)
+		ImportStd()
+		go func() {
+			ticker := time.NewTicker(time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				updateLogFile()
+			}
+		}()
 	}
+}
+
+func updateLogFile() {
+	newLogFilePath := getLogFileFullPath()
+	if logFilePath != newLogFilePath {
+		newF := openLogFile(newLogFilePath)
+		logger.SetOutput(newF)
+		logger.SetPrefix(DefaultPrefix)
+		logger.SetFlags(log.LstdFlags)
+		if F != nil {
+			fileMgr.AddFile(F)
+			go func() {
+				fileMgr.Collect()
+			}()
+		}
+		F = newF
+		ImportStd()
+	}
+}
+
+func ImportStd() {
+	log.SetOutput(F)
+	os.Stdout = F
+	os.Stderr = F
 }
 
 func Debug(v ...interface{}) {
