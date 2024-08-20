@@ -1,4 +1,4 @@
-package base
+package curd
 
 import (
 	"database/sql/driver"
@@ -13,10 +13,6 @@ import (
 )
 
 var mysql func() *gorm.DB
-
-func WithMysql(mysqlFunc func() *gorm.DB) {
-	mysql = mysqlFunc
-}
 
 // Search 搜索结构模型
 type Search struct {

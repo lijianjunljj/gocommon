@@ -1,4 +1,4 @@
-package base
+package curd
 
 import (
 	"github.com/gin-gonic/gin"
