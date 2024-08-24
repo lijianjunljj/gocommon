@@ -34,7 +34,7 @@ func NewHandler(model interface{}, models ...interface{}) *Handler {
 }
 
 // List 分页列表
-func (h *Handler) List(ctx *gin.Context, extras ...Extra) {
+func (h *Handler) List(ctx *gin.Context, isHook bool, extras ...Extra) {
 	var search Search
 	err := ctx.ShouldBindBodyWith(&search, binding.JSON)
 	if err != nil {
@@ -47,7 +47,7 @@ func (h *Handler) List(ctx *gin.Context, extras ...Extra) {
 	}
 	svc := NewService(h.model)
 	l := NewLogic(svc, h.models)
-	count, err := l.List(&search, false, extras...)
+	count, err := l.List(&search, isHook, extras...)
 	if err != nil {
 		utils.Fail(ctx, err)
 		return
