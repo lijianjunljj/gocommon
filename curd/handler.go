@@ -43,7 +43,7 @@ func (h *Handler) List(ctx *gin.Context, isHook bool, extras ...Extra) {
 	}
 	isSelf := ctx.GetBool("is_self")
 	if isSelf {
-		search.Search["user_id"] = ctx.GetString("userID")
+		search.Conditions["user_id"] = ctx.GetString("userID")
 	}
 	svc := NewService(h.model)
 	l := NewLogic(svc, h.models)
@@ -71,7 +71,7 @@ func (h *Handler) All(ctx *gin.Context, extras ...Extra) {
 	}
 	isSelf := ctx.GetBool("is_self")
 	if isSelf {
-		search.Search["user_id"] = ctx.GetString("userID")
+		search.Conditions["user_id"] = ctx.GetString("userID")
 	}
 	svc := NewService(h.model)
 	l := NewLogic(svc, h.models)
@@ -93,7 +93,7 @@ func (h *Handler) ListWithHook(ctx *gin.Context, extras ...Extra) {
 	}
 	isSelf := ctx.GetBool("is_self")
 	if isSelf {
-		search.Search["user_id"] = ctx.GetString("userID")
+		search.Conditions["user_id"] = ctx.GetString("userID")
 	}
 	svc := NewService(h.model)
 	l := NewLogic(svc, h.models)

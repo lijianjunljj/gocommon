@@ -54,7 +54,7 @@ func NewLogic(service interface{}, models ...interface{}) *Logic {
 func (l *Logic) List(search *Search, isHook bool, extras ...Extra) (int64, error) {
 	parseSearch(search)
 	var temp = make(map[string]interface{})
-	for key, value := range search.Search {
+	for key, value := range search.Conditions {
 		str := utils.ToStr(value)
 		tp := reflect.TypeOf(value)
 		if tp.Kind().String() != "slice" {
@@ -66,7 +66,7 @@ func (l *Logic) List(search *Search, isHook bool, extras ...Extra) (int64, error
 			temp[key] = value
 		}
 	}
-	search.Search = temp
+	search.Conditions = temp
 
 	count, err := l.svc.API.List(search, isHook, l.models)
 	if err != nil {

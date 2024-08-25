@@ -16,11 +16,11 @@ var mysql func() *gorm.DB
 
 // Search 搜索结构模型
 type Search struct {
-	PageSize  int                    `json:"pageSize"`
-	PageNum   int                    `json:"pageNum"`
-	Search    map[string]interface{} `json:"search"`
-	SortField string                 `json:"sortField"`
-	SortOrder string                 `json:"sortOrder"`
+	PageSize   int                    `json:"pageSize" validate:"max=100"`
+	PageNum    int                    `json:"pageNum"  validate:"max=100"`
+	Conditions map[string]interface{} `json:"conditions"`
+	SortField  string                 `json:"sortField"`
+	SortOrder  string                 `json:"sortOrder"`
 }
 
 // Model 基础模型
@@ -69,7 +69,7 @@ func StrToSlice(str string) []string {
 func (m *Model) Query(search *Search, isHook bool, model interface{}, isPages bool) (int64, error) {
 	var count int64
 	db := mysql().Model(model)
-	for key, value := range search.Search {
+	for key, value := range search.Conditions {
 		fieldName := utils.CamelToLine(key)
 		str := utils.ToStr(value)
 		tp := reflect.TypeOf(value)
