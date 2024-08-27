@@ -19,6 +19,7 @@ type Pages struct {
 	Count    int64       `json:"count"`
 	PageSize int         `json:"pageSize"`
 	PageNum  int         `json:"pageNum"`
+	Extra    interface{} `json:"extra"`
 }
 
 // NewHandler 实例化操作

@@ -23,6 +23,16 @@ type Search struct {
 	SortOrder  string                 `json:"sortOrder"`
 }
 
+func (that *Search) Check() error {
+	if that.PageSize >= 100 {
+		return errors.New("参数错误")
+	}
+	if that.PageNum >= 100 {
+		return errors.New("参数错误")
+	}
+	return nil
+}
+
 // Model 基础模型
 type Model struct {
 	ID         string `json:"id" gorm:"type:varchar(30)"`
