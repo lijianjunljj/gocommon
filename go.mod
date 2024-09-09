@@ -12,6 +12,7 @@ require (
 	github.com/go-playground/validator/v10 v10.14.1
 	github.com/gomodule/redigo v1.8.9
 	github.com/mna/redisc v1.3.2
+	github.com/nfnt/resize v0.0.0-20180221191011-83c6a9932646
 	github.com/olebedev/config v0.0.0-20220822221314-86fa169f9f99
 	github.com/satori/go.uuid v1.2.0
 	github.com/streadway/amqp v1.0.0

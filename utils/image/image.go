@@ -6,6 +6,10 @@ import (
 	"encoding/base64"
 	"fmt"
 	"github.com/disintegration/imaging"
+	"github.com/nfnt/resize"
+	"image"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"log"
 	"net/url"
@@ -45,6 +49,47 @@ func ImageRescale(scale float32, inputFile, outputFile string) {
 	if err != nil {
 		log.Fatalf("Save output file failed: %v", err)
 	}
+}
+func CheckImageFormat(data []byte) string {
+	if len(data) >= 2 && data[0] == 0xff && data[1] == 0xd8 {
+		return "JPEG"
+	}
+	if len(data) >= 8 && data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4e && data[3] == 0x47 &&
+		data[4] == 0x0d && data[5] == 0x0a && data[6] == 0x1a && data[7] == 0x0a {
+		return "PNG"
+	}
+	if len(data) >= 4 && data[0] == 0x47 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x38 {
+		return "GIF"
+	}
+	return "Unknown"
+}
+func ImageResizeBytes(data []byte, width, height int) []byte {
+	var img image.Image
+	var err error
+	// 判断图像格式并解码
+	imageFormat := CheckImageFormat(data)
+	if imageFormat == "JPEG" {
+		img, err = jpeg.Decode(bytes.NewReader(data))
+	} else if imageFormat == "PNG" {
+		img, err = png.Decode(bytes.NewReader(data))
+	} else {
+		log.Fatal("Unsupported image format")
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 调整图像尺寸
+	resized := resize.Resize(uint(width), uint(height), img, resize.Lanczos3)
+
+	// 将调整后的图像编码回字节切片
+	var buf bytes.Buffer
+	err = jpeg.Encode(&buf, resized, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return buf.Bytes()
 }
 
 func ImageResize(width, height int, inputFile, outputFile string) {
