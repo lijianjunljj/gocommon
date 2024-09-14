@@ -1,6 +1,8 @@
 package utils
 
-import "fmt"
+import (
+	"fmt"
+)
 
 func GenerateSequence(n int) []int {
 	sequence := []int{}
@@ -9,6 +11,7 @@ func GenerateSequence(n int) []int {
 	}
 	return sequence
 }
+
 // 全排列
 func Permute[T any](nums []T) [][]T {
 	var results [][]T
