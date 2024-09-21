@@ -5,6 +5,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/binding"
 	"github.com/lijianjunljj/gocommon/utils"
+	"strconv"
 )
 
 // Handler 操作层
@@ -42,8 +43,16 @@ func (h *Handler) List(ctx *gin.Context, isHook bool, extras ...Extra) {
 		utils.Fail(ctx, err)
 		return
 	}
-	isSelf := ctx.GetBool("is_self")
+	is_self := ctx.Query("is_self")
+	isSelf, err := strconv.ParseBool(is_self)
+	if err != nil {
+		utils.Fail(ctx, err)
+		return
+	}
 	if isSelf {
+		if search.Conditions == nil {
+			search.Conditions = make(map[string]interface{})
+		}
 		search.Conditions["user_id"] = ctx.GetString("userID")
 	}
 	svc := NewService(h.model)
