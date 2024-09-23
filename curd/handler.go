@@ -44,16 +44,19 @@ func (h *Handler) List(ctx *gin.Context, isHook bool, extras ...Extra) {
 		return
 	}
 	is_self := ctx.Query("is_self")
-	isSelf, err := strconv.ParseBool(is_self)
-	if err != nil {
-		utils.Fail(ctx, err)
-		return
-	}
-	if isSelf {
-		if search.Conditions == nil {
-			search.Conditions = make(map[string]interface{})
+
+	if is_self != "" {
+		isSelf, err := strconv.ParseBool(is_self)
+		if err != nil {
+			utils.Fail(ctx, err)
+			return
 		}
-		search.Conditions["user_id"] = ctx.GetString("userID")
+		if isSelf {
+			if search.Conditions == nil {
+				search.Conditions = make(map[string]interface{})
+			}
+			search.Conditions["user_id"] = ctx.GetString("userID")
+		}
 	}
 	svc := NewService(h.model)
 	l := NewLogic(svc, h.models)
