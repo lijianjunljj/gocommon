@@ -2,10 +2,26 @@ package decimal
 
 import "github.com/shopspring/decimal"
 
-func Add(v1, v2 float64, round int32) (float64, bool) {
-	return decimal.NewFromFloat(v1).Add(decimal.NewFromFloat(v2)).Round(round).Float64()
+func Add(round int32, args ...float64) float64 {
+	d := decimal.NewFromFloat(0)
+	for _, v := range args {
+		d = d.Add(decimal.NewFromFloat(v))
+	}
+	v, ok := d.Round(round).Float64()
+	if ok {
+		return v
+	}
+	return 0
 }
 
-func Mul(v1, v2 float64, round int32) (float64, bool) {
-	return decimal.NewFromFloat(v1).Mul(decimal.NewFromFloat(v2)).Round(round).Float64()
+func Mul(round int32, args ...float64) float64 {
+	d := decimal.NewFromFloat(1)
+	for _, v := range args {
+		d = d.Mul(decimal.NewFromFloat(v))
+	}
+	v, ok := d.Round(round).Float64()
+	if ok {
+		return v
+	}
+	return 0
 }
