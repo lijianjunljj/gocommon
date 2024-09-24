@@ -25,3 +25,27 @@ func Mul(round int32, args ...float64) float64 {
 	}
 	return 0
 }
+
+func Sub(round int32, args ...float64) float64 {
+	d := decimal.NewFromFloat(args[0])
+	for _, v := range args {
+		d = d.Sub(decimal.NewFromFloat(v))
+	}
+	v, ok := d.Round(round).Float64()
+	if ok {
+		return v
+	}
+	return 0
+}
+
+func Div(round int32, args ...float64) float64 {
+	d := decimal.NewFromFloat(args[0])
+	for _, v := range args {
+		d = d.Div(decimal.NewFromFloat(v))
+	}
+	v, ok := d.Round(round).Float64()
+	if ok {
+		return v
+	}
+	return 0
+}
