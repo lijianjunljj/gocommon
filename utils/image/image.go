@@ -84,7 +84,7 @@ func ImageResizeBytes(data []byte, width, height int) []byte {
 
 	// 将调整后的图像编码回字节切片
 	var buf bytes.Buffer
-	err = jpeg.Encode(&buf, resized, nil)
+	err = jpeg.Encode(&buf, resized, &jpeg.Options{Quality: 100})
 	if err != nil {
 		log.Fatal(err)
 	}
