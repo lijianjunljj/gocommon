@@ -41,6 +41,7 @@ type Model struct {
 	UpdateTime int64  `json:"update_time"`
 	IsChanged  int8   `json:"is_changed" gorm:"type:tinyint(4) DEFAULT 0"`
 	mysql      func() *gorm.DB
+	where      string
 }
 
 type ModelIdInt struct {
@@ -74,6 +75,10 @@ func StrToSlice(str string) []string {
 	str = strings.ReplaceAll(str, "]", "")
 	return strings.Split(str, ",")
 }
+func (m *Model) Where(where string) *Model {
+	m.where = where
+	return m
+}
 
 // Query 解析参数链式查询
 func (m *Model) Query(search *Search, isHook bool, model interface{}, isPages bool) (int64, error) {
@@ -89,13 +94,17 @@ func (m *Model) Query(search *Search, isHook bool, model interface{}, isPages bo
 			db = db.Where("create_time > ?", str)
 		} else if key == "endTime" {
 			db = db.Where("create_time < ?", str)
-		} else if tp.Kind().String() == "string" {
+		} else if tp.Kind().String() == "string" && key != "user_id" {
 			db = db.Where(fieldName+" LIKE  ?", "%"+str+"%")
 		} else if tp.Kind().String() == "slice" {
 			db = db.Where(fieldName+" IN  (?)", StrToSlice(str))
 		} else {
 			db = db.Where(fieldName+" =  ?", str)
 		}
+	}
+
+	if m.where != "" {
+		db = db.Where(m.where)
 	}
 	db = db.Order(search.SortField + " " + search.SortOrder)
 	var result *gorm.DB
