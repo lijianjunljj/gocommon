@@ -58,7 +58,7 @@ func (l *Logic) List(search *Search, isHook bool, extras ...Extra) (int64, error
 		str := utils.ToStr(value)
 		tp := reflect.TypeOf(value)
 		if tp.Kind().String() != "slice" {
-			if ok, _ := regexp.Match("^[\u4e00-\u9fa5a-z0-9_-]{0,}$", []byte(str)); !ok {
+			if ok, _ := regexp.Match("^[\u4e00-\u9fa5a-zA-Z0-9_-]{0,}$", []byte(str)); !ok {
 				return 0, errors.New("查询参数包含非法字符")
 			}
 		}
