@@ -2,8 +2,13 @@ package decimal
 
 import (
 	"github.com/shopspring/decimal"
+	"strconv"
+	"fmt"
 )
-
+func Fixed(value float64,formatStr string) float64 {
+	value, _ = strconv.ParseFloat(fmt.Sprintf(formatStr, value), 64)
+	return value
+}
 func Add(round int32, args ...float64) float64 {
 	d := decimal.NewFromFloat(0)
 	for _, v := range args {
