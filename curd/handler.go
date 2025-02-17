@@ -213,6 +213,7 @@ func (h *Handler) Delete(ctx *gin.Context, extras ...Extra) {
 		utils.Fail(ctx, err)
 		return
 	}
+	fmt.Println("params[\"id\"]:",params["id"])
 	svc := NewService(h.model)
 	l := NewLogic(svc)
 	err = l.Delete(fmt.Sprintf("%v", params["id"]), extras...)

@@ -158,6 +158,6 @@ func (m *Model) Edit(model interface{}) error {
 
 // Delete 通用删除功能
 func (m *Model) Delete(model interface{}) error {
-	result := mysql().Delete(model)
+	result := mysql().Debug().Delete(model)
 	return result.Error
 }

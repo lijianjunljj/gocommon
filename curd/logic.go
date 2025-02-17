@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"fmt"
 )
 
 // Logic 逻辑层
@@ -215,6 +216,7 @@ func (l *Logic) Delete(str string, extras ...Extra) error {
 	if len(ids) == 0 {
 		return errors.New("ID不能为空")
 	}
+
 	for _, item := range ids {
 		mv := reflect.ValueOf(l.svc.Model).Elem()
 		switch id.Type.String() {
@@ -225,7 +227,12 @@ func (l *Logic) Delete(str string, extras ...Extra) error {
 			parseInt, _ := strconv.ParseInt(item, 10, 64)
 			mv.FieldByName("ID").SetUint(uint64(parseInt))
 			break
+		case "int64":
+			parseInt, _ := strconv.ParseInt(item, 10, 64)
+			mv.FieldByName("ID").SetInt(parseInt)
+			break
 		default:
+			fmt.Println("id.Type:",id.Type.String())
 			break
 		}
 
