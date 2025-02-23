@@ -15,7 +15,15 @@ func NewTxn(tx *gorm.DB) *Txn {
 	that.PreTxn()
 	return that
 }
-
+func (that *Txn) TryRollback() error {
+	if that.isCommit {
+		err := that.Tx.Rollback().Error
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
 func (that *Txn) TryCommit() error {
 	if that.isCommit {
 		err := that.Tx.Commit().Error
