@@ -35,7 +35,7 @@ func (that *Search) Check() error {
 
 // Model 基础模型
 type Model struct {
-	ID         string `json:"id" gorm:"type:varchar(30)"`
+	ID         string `json:"id" gorm:"type:varchar(30);primary_key"`
 	CreateBy   string `json:"create_by" gorm:"type:varchar(30)"`
 	CreateTime int64  `json:"create_time"`
 	UpdateTime int64  `json:"update_time"`
@@ -116,9 +116,9 @@ func (m *Model) Query(search *Search, isHook bool, model interface{}, isPages bo
 		db = db.Offset((search.PageNum - 1) * search.PageSize).Limit(search.PageSize)
 	}
 	if isHook {
-		result = db.Find(model)
+		result = db.Debug().Find(model)
 	} else {
-		result = db.Session(&gorm.Session{SkipHooks: true}).Find(model)
+		result = db.Debug().Session(&gorm.Session{SkipHooks: true}).Find(model)
 	}
 
 	if result.Error != nil && !errors.Is(result.Error, gorm.ErrRecordNotFound) {
