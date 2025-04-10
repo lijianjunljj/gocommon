@@ -44,10 +44,10 @@ func (my *Mysql) Connect() *gorm.DB {
 	newLogger := gormLogger.New(
 		log.New(comLoger.Writer(), "\r\n", log.LstdFlags), // io writer)
 		gormLogger.Config{
-			IgnoreRecordNotFoundError:true,
-			SlowThreshold: 200000 * time.Microsecond, // 慢 SQL 阈值
-			LogLevel:      gormLogger.Warn,           // Log level
-			Colorful:      true,                      // 禁用彩色打印
+			IgnoreRecordNotFoundError: true,
+			SlowThreshold:             200000 * time.Microsecond, // 慢 SQL 阈值
+			LogLevel:                  gormLogger.Warn,           // Log level
+			Colorful:                  true,                      // 禁用彩色打印
 		},
 	)
 
@@ -55,7 +55,7 @@ func (my *Mysql) Connect() *gorm.DB {
 		DisableAutomaticPing:                     false,
 		DisableForeignKeyConstraintWhenMigrating: true,
 		SkipDefaultTransaction:                   true,
-		PrepareStmt:                              true,
+		PrepareStmt:                              !my.config.NotPreparedStmt,
 		Logger:                                   newLogger,
 	})
 	if err != nil {
@@ -92,7 +92,7 @@ func (my *Mysql) DB() *gorm.DB {
 	return my.MysqlDB
 }
 
-//AutoMigrate Mysql数据库自动同步结构体
+// AutoMigrate Mysql数据库自动同步结构体
 func (my *Mysql) AutoMigrate(dst ...interface{}) {
 	if my.AutoMigrateDisable {
 		return

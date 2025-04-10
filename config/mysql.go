@@ -12,6 +12,7 @@ type MysqlOptions struct {
 	MysqlLifeTimeout int
 	MysqlMaxOpenCons int
 	MysqlMaxIdleCons int
+	NotPreparedStmt  bool
 }
 
 func NewMysqlOptions(opts ...MysqlOption) MysqlOptions {
@@ -82,10 +83,8 @@ func DbName(v string) MysqlOption {
 	}
 }
 
-//func (mysql *MysqlOptions) Parse(filePath string) {
-//
-//}
-//
-//func (mysql *MysqlOptions) Init() {
-//
-//}
+func NotPreparedStmt(v bool) MysqlOption {
+	return func(o *MysqlOptions) {
+		o.NotPreparedStmt = v
+	}
+}
