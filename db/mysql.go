@@ -28,6 +28,9 @@ func (my *Mysql) Connect() *gorm.DB {
 	lifeTime := my.config.MysqlLifeTimeout
 	fmt.Println(timeout, maxopenconns, maxidleconns, lifeTime)
 	var link = my.config.DbUser + ":" + my.config.DbPassWord + "@tcp(" + my.config.DbHost + ":" + my.config.DbPort + ")/" + my.config.DbName + "?charset=utf8mb4&parseTime=True&loc=Local&interpolateParams=true&timeout=" + timeout
+	if my.config.SQLMode != "" {
+		link += "&sql_mode=" + my.config.SQLMode
+	}
 	fmt.Println(link)
 	comLoger, _ := commonLoger.NewLoger("", log.LstdFlags, func() string {
 		now := time.Now()

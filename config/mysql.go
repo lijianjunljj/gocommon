@@ -13,6 +13,7 @@ type MysqlOptions struct {
 	MysqlMaxOpenCons int
 	MysqlMaxIdleCons int
 	NotPreparedStmt  bool
+	SQLMode          string
 }
 
 func NewMysqlOptions(opts ...MysqlOption) MysqlOptions {
