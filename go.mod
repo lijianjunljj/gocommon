@@ -14,6 +14,7 @@ require (
 	github.com/mna/redisc v1.3.2
 	github.com/nfnt/resize v0.0.0-20180221191011-83c6a9932646
 	github.com/olebedev/config v0.0.0-20220822221314-86fa169f9f99
+	github.com/opentracing/opentracing-go v1.2.0
 	github.com/satori/go.uuid v1.2.0
 	github.com/shopspring/decimal v1.4.0
 	github.com/sony/sonyflake v1.2.0

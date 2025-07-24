@@ -2,6 +2,8 @@ package utils
 
 import (
 	"fmt"
+	"sync"
+
 	"github.com/lijianjunljj/gocommon/utils"
 )
 
@@ -18,6 +20,7 @@ var unixID *UnixID
 
 // UnixID 定义时间戳ID结构体
 type UnixID struct {
+	sync.Mutex // 添加互斥锁
 	//WorkerID 机器ID
 	WorkerID int64
 	//LastTimeUnix 上次生成ID的时间戳
@@ -54,6 +57,8 @@ func WithWorkerID(workerID int64) UnixIDOption {
 
 // Next 线程安全的获得下一个 ID 的方法
 func (id *UnixID) Next() int64 {
+	id.Lock()
+	defer id.Unlock()
 	timestamp := utils.TimeUnix()
 	//如果当前时间小于上一次ID生成的时间戳: 说明系统时钟回退过 - 这个时候应当抛出异常
 	if timestamp < id.LastTimeUnix {
@@ -89,8 +94,8 @@ func NextTimeUnix(lastTimeUnix int64) int64 {
 }
 
 // InitUnixID 初始化时间戳组合ID
-func InitUnixID() {
-	unixID = NewUnixID()
+func InitUnixID(opts ...UnixIDOption) {
+	unixID = NewUnixID(opts...)
 }
 
 // GetUnixID 获取时间戳组合ID
