@@ -4,12 +4,14 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
-	"github.com/lijianjunljj/gocommon/utils"
 	"reflect"
+
+	"github.com/lijianjunljj/gocommon/utils"
+
+	"strings"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
-	"strings"
 )
 
 var mysql func() *gorm.DB
@@ -116,9 +118,9 @@ func (m *Model) Query(search *Search, isHook bool, model interface{}, isPages bo
 		db = db.Offset((search.PageNum - 1) * search.PageSize).Limit(search.PageSize)
 	}
 	if isHook {
-		result = db.Debug().Find(model)
+		result = db.Find(model)
 	} else {
-		result = db.Debug().Session(&gorm.Session{SkipHooks: true}).Find(model)
+		result = db.Session(&gorm.Session{SkipHooks: true}).Find(model)
 	}
 
 	if result.Error != nil && !errors.Is(result.Error, gorm.ErrRecordNotFound) {
@@ -140,7 +142,7 @@ func (m *Model) All(search *Search, isHook bool, models interface{}) error {
 
 // Detail 通用详情查询
 func (m *Model) Detail(model interface{}) error {
-	result := mysql().Find(model, m.ID)
+	result := mysql().Where("id = ?", m.ID).First(model)
 	return result.Error
 }
 
