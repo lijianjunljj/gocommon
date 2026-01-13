@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strconv"
 
 	"github.com/lijianjunljj/gocommon/utils"
 
@@ -51,6 +52,60 @@ type ModelIdInt struct {
 	CreateBy   string `json:"create_by" gorm:"type:varchar(30)"`
 	CreateTime int64  `json:"create_time"`
 	UpdateTime int64  `json:"update_time"`
+	mysql      func() *gorm.DB
+	where      string
+}
+
+// Where 设置查询条件
+func (m *ModelIdInt) Where(where string) *ModelIdInt {
+	m.where = where
+	return m
+}
+
+// Query 解析参数链式查询
+func (m *ModelIdInt) Query(search *Search, isHook bool, model interface{}, isPages bool) (int64, error) {
+	modelBase := &Model{
+		ID:    strconv.FormatUint(m.ID, 10),
+		where: m.where,
+	}
+	return modelBase.Query(search, isHook, model, isPages)
+}
+
+// List 通用分页列表查询
+func (m *ModelIdInt) List(search *Search, isHook bool, models interface{}) (int64, error) {
+	return m.Query(search, isHook, models, true)
+}
+
+// All 通用所有列表查询
+func (m *ModelIdInt) All(search *Search, isHook bool, models interface{}) error {
+	_, err := m.Query(search, isHook, models, false)
+	return err
+}
+
+// Detail 通用详情查询
+func (m *ModelIdInt) Detail(model interface{}) error {
+	modelBase := &Model{
+		ID: strconv.FormatUint(m.ID, 10),
+	}
+	return modelBase.Detail(model)
+}
+
+// Add 通用新增功能
+func (m *ModelIdInt) Add(model interface{}) error {
+	modelBase := &Model{}
+	return modelBase.Add(model)
+}
+
+// Edit 通用编辑功能
+func (m *ModelIdInt) Edit(model interface{}) error {
+	modelBase := &Model{}
+	return modelBase.Edit(model)
+}
+
+// Delete 通用删除功能
+func (m *ModelIdInt) Delete(model interface{}) error {
+	modelBase := &Model{}
+	return modelBase.Delete(model)
 }
 
 // Params 入参ID模型
@@ -142,7 +197,34 @@ func (m *Model) All(search *Search, isHook bool, models interface{}) error {
 
 // Detail 通用详情查询
 func (m *Model) Detail(model interface{}) error {
-	result := mysql().Where("id = ?", m.ID).First(model)
+	// 直接使用 First，GORM 会根据模型的主键字段自动处理
+	// 如果 model 的 ID 字段已经有值，GORM 会自动使用该值作为查询条件
+	// 如果 model 的 ID 字段为空，但 m.ID 有值，需要手动设置
+	modelValue := reflect.ValueOf(model).Elem()
+	modelType := reflect.TypeOf(model).Elem()
+
+	// 查找 ID 字段
+	idField, found := modelType.FieldByName("ID")
+	if found {
+		idValue := modelValue.FieldByName("ID")
+		switch idField.Type.Kind() {
+		case reflect.String:
+			if idValue.String() == "" && m.ID != "" {
+				// 如果 model 的 ID 为空，但 m.ID 有值，设置 model 的 ID
+				idValue.SetString(m.ID)
+			}
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			if idValue.Uint() == 0 && m.ID != "" {
+				// 如果 model 的 ID 为 0，但 m.ID 有值，尝试转换并设置
+				if parsedID, err := strconv.ParseUint(m.ID, 10, 64); err == nil {
+					idValue.SetUint(parsedID)
+				}
+			}
+		}
+	}
+
+	// 直接使用 First，GORM 会根据模型的主键字段自动处理
+	result := mysql().First(model)
 	return result.Error
 }
 

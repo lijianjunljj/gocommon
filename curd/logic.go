@@ -2,12 +2,13 @@ package curd
 
 import (
 	"errors"
-	"github.com/lijianjunljj/gocommon/utils"
+	"fmt"
 	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
-	"fmt"
+
+	"github.com/lijianjunljj/gocommon/utils"
 )
 
 // Logic 逻辑层
@@ -192,7 +193,9 @@ func (l *Logic) Detail(extras ...Extra) error {
 		}
 		break
 	case "uint64":
-		if ID := mv.FieldByName("ID").Interface().(uint64); ID == 0 {
+		ID := mv.FieldByName("ID").Interface().(uint64)
+		fmt.Println("ID:", ID)
+		if ID == 0 {
 			return errors.New("ID不能为空")
 		}
 		break
@@ -232,7 +235,6 @@ func (l *Logic) Delete(str string, extras ...Extra) error {
 			mv.FieldByName("ID").SetInt(parseInt)
 			break
 		default:
-			fmt.Println("id.Type:",id.Type.String())
 			break
 		}
 
