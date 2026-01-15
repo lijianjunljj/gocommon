@@ -1,6 +1,7 @@
 package kuaishou
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/sha1"
@@ -21,6 +22,10 @@ const (
 	Code2SessionURL = BaseURL + "/oauth2/mp/code2session"
 	// GetAccessTokenURL 获取接口调用凭证access_token接口地址
 	GetAccessTokenURL = BaseURL + "/oauth2/access_token"
+
+	// GiftOperationURL 送出礼物接口地址
+	// 文档：/openapi/developer/live/data/interactive/action/relaxPlay/giftOperation
+	GiftOperationURL = BaseURL + "/openapi/developer/live/data/interactive/action/relaxPlay/giftOperation"
 )
 
 // Client 快手开放平台客户端
@@ -328,4 +333,132 @@ func DecryptAndParseUserInfo(sessionKey, encryptedData, iv string) (*UserInfo, e
 	}
 
 	return &userInfo, nil
+}
+
+// --------------------- 礼物发送相关 ---------------------
+
+// GiftItem 礼物项
+type GiftItem struct {
+	GiftID int64 `json:"giftId"` // 礼物ID
+	Count  int   `json:"count"`  // 礼物数量
+}
+
+// GiftSendData data 字段中的业务数据
+// 注意：最终会被序列化为 JSON 字符串放入外层 data 字段
+type GiftSendData struct {
+	OpenID         string     `json:"openId"`         // 送礼用户 openId
+	OutOrderNo     string     `json:"outOrderNo"`     // 送出礼物订单号，开发者自定义，幂等
+	RoomID         string     `json:"roomId"`         // 直播间房间ID
+	ToUserOpenID   string     `json:"toUserOpenId"`   // 收礼用户 openId
+	RoomType       int        `json:"roomType"`       // 房间类型
+	SendSourceType int        `json:"sendSourceType"` // 送礼来源类型
+	GiftList       []GiftItem `json:"giftList"`       // 送出的礼物列表
+	TotalGiftValue int64      `json:"totalGiftValue"` // 送出的礼物总价值，单位：快币，防止参数被篡改
+}
+
+// GiftOperationRequest 送礼接口请求结构
+// 注意：data 字段是 JSON 字符串，不需要再进行 encode
+type GiftOperationRequest struct {
+	Timestamp  int64  `json:"timestamp"`  // 当前时间戳（毫秒）
+	Sign       string `json:"sign"`       // 签名，按快手文档规则生成
+	ModuleType string `json:"moduleType"` // 固定为 giftOperation
+	ActionType string `json:"actionType"` // 固定为 sendGift
+	Data       string `json:"data"`       // 业务参数 JSON 字符串
+}
+
+// GiftOperationResponse 送礼接口响应
+type GiftOperationResponse struct {
+	Result   int    `json:"result"`   // 结果码，1 表示成功
+	ErrorMsg string `json:"errorMsg"` // 错误信息
+	Data     string `json:"data"`     // 业务数据，内部再解析
+}
+
+// SendGift 调用快手送礼物接口
+// sign 为已经按照快手文档规则生成的签名；本方法只负责请求封装与发送
+func (c *Client) SendGift(sign string, data *GiftSendData) (*GiftOperationResponse, error) {
+	if data == nil {
+		return nil, fmt.Errorf("gift data is nil")
+	}
+
+	// data 字段要求是 JSON 字符串
+	dataBytes, err := json.Marshal(data)
+	if err != nil {
+		return nil, fmt.Errorf("marshal gift data failed: %w", err)
+	}
+
+	reqBody := GiftOperationRequest{
+		Timestamp:  time.Now().UnixMilli(),
+		Sign:       sign,
+		ModuleType: "giftOperation",
+		ActionType: "sendGift",
+		Data:       string(dataBytes),
+	}
+
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("marshal gift request failed: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", GiftOperationURL, io.NopCloser(bytes.NewReader(bodyBytes)))
+	if err != nil {
+		return nil, fmt.Errorf("创建请求失败: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取响应失败: %w", err)
+	}
+
+	var result GiftOperationResponse
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("解析响应失败: %w", err)
+	}
+
+	if result.Result != 1 {
+		return nil, fmt.Errorf("快手送礼物接口错误: %s", result.ErrorMsg)
+	}
+
+	return &result, nil
+}
+
+// PaymentOrderInfo 支付订单信息
+type PaymentOrderInfo struct {
+	OrderNo        string `json:"order_no"`         // 订单号（快手平台订单号）
+	OutOrderNo     string `json:"out_order_no"`     // 外部订单号（商户订单号）
+	OrderInfoToken string `json:"order_info_token"` // 订单token
+}
+
+// PayResult 支付结果
+type PayResult struct {
+	PayStatus string `json:"payStatus"` // 支付状态: SUCCESS-成功, FAILED-失败, INSUFFICIENT_BALANCE-余额不足, PROCESSING-处理中
+}
+
+// PayStatus 支付状态常量
+const (
+	PayStatusSuccess             = "SUCCESS"              // 成功
+	PayStatusFailed              = "FAILED"               // 失败
+	PayStatusInsufficientBalance = "INSUFFICIENT_BALANCE" // 余额不足
+	PayStatusProcessing          = "PROCESSING"           // 处理中
+)
+
+// ValidatePayResult 验证支付结果
+func ValidatePayResult(payStatus string) bool {
+	switch payStatus {
+	case PayStatusSuccess, PayStatusFailed, PayStatusInsufficientBalance, PayStatusProcessing:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsPaySuccess 判断支付是否成功
+func IsPaySuccess(payStatus string) bool {
+	return payStatus == PayStatusSuccess
 }
