@@ -1,16 +1,19 @@
 package curd
 
 import (
+	"sync"
+
 	"github.com/lijianjunljj/gocommon/config"
 	"github.com/lijianjunljj/gocommon/db"
 	"gorm.io/gorm"
-	"sync"
 )
 
 var (
 	mysqlInstance *db.Mysql
 	once          sync.Once
 	configs       *config.MysqlOptions
+
+	AutoMigrateCallFunc func(dst ...interface{}) error
 )
 
 func Init(options *config.MysqlOptions) {
@@ -35,5 +38,9 @@ func GetInstance() *db.Mysql {
 func AutoMigrate(dst ...interface{}) {
 	GetInstance()
 	mysqlInstance.AutoMigrate(dst...)
+
+	if AutoMigrateCallFunc != nil {
+		AutoMigrateCallFunc(dst...)
+	}
 
 }

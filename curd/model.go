@@ -49,9 +49,9 @@ type Model struct {
 
 type ModelIdInt struct {
 	ID         uint64 `json:"id"          gorm:"primary_key;AUTO_INCREMENT"`
-	CreateBy   string `json:"create_by" gorm:"type:varchar(30)"`
-	CreateTime int64  `json:"create_time"`
-	UpdateTime int64  `json:"update_time"`
+	CreateBy   string `json:"-" gorm:"type:varchar(30)"`
+	CreateTime int64  `json:"-"`
+	UpdateTime int64  `json:"-"`
 	mysql      func() *gorm.DB
 	where      string
 }

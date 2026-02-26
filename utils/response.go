@@ -3,8 +3,9 @@ package utils
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/go-playground/validator/v10"
 	"strings"
+
+	"github.com/go-playground/validator/v10"
 
 	"github.com/gin-gonic/gin"
 )
@@ -29,11 +30,14 @@ type Response struct {
 
 // Success 响应成功
 func Success(ctx *gin.Context, data interface{}) {
-	ctx.JSON(200, Response{
+	response := Response{
 		Code:    CodeSuccess,
 		Message: "成功",
 		Data:    data,
-	})
+	}
+	jsonData, _ := json.Marshal(response)
+	fmt.Println("response:", string(jsonData))
+	ctx.JSON(200, response)
 }
 
 // Fail 响应错误

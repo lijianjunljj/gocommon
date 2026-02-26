@@ -43,3 +43,18 @@ func GetID() (uint64, error) {
 	}
 	return sf.NextID()
 }
+
+// GetIDInt32 获取唯一ID（int32类型）
+// 将雪花算法生成的 uint64 ID 转换为 int32，使用取模确保值在 int32 范围内（0 到 2147483647）
+func GetIDInt32() (int32, error) {
+	if sf == nil {
+		return 0, errors.New("sonyflake not initialized")
+	}
+	id, err := sf.NextID()
+	if err != nil {
+		return 0, err
+	}
+	// 将 uint64 转换为 int32，使用取模确保值在 int32 范围内（0 到 2147483647）
+	// 注意：int32 的最大值是 2147483647
+	return int32(id % 2147483647), nil
+}
