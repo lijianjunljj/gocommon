@@ -20,10 +20,12 @@ var (
 
 // NotSyncToDatabase 是否需要同步到数据库的标记类型
 // 注意：这是一个自定义类型（底层是 bool），用于在模型中匿名嵌入：
-//   type FigureAttribute struct {
-//       ...
-//       gts.NotSyncToDatabase `json:"-"`
-//   }
+//
+//	type FigureAttribute struct {
+//	    ...
+//	    gts.NotSyncToDatabase `json:"-"`
+//	}
+//
 // 通过反射只识别这个具体类型，避免其它匿名 bool 字段误触发。
 type NotSyncToDatabase bool
 
@@ -92,9 +94,11 @@ type TableCache struct {
 	rowLocks    sync.Map          // 行级别的读写锁，key 为主键 ID，value 为 *sync.RWMutex
 	primaryKey  string            // 主键字段名，默认为 "ID"
 	reflectInfo *ModelReflectInfo // 反射信息缓存
-	// index 为二级索引：key 为查询条件序列化后的字符串，value 为主键 ID(string)
-	// 仅用于加速常用查询场景（例如 api_type+room_id，user_info_id 等），真实数据仍以 data + DB 为准。
-	index sync.Map
+	// 联合二级索引：index[表字段][字段值] = id 集合；多条件查询时取交集
+	// index: key=fieldName(string), value=*sync.Map(key=valueStr, value=*sync.Map(key=id, value=struct{}))
+	index         sync.Map
+	indexReverse  sync.Map // key=id(string), value=*sync.Map(key="field|value", value=struct{})，用于 Update/Delete 时清理与重建
+	indexedFields sync.Map // key=fieldName(string), value=struct{}，记录参与过索引的字段，用于重建
 }
 
 // OperationLog 操作日志
@@ -130,6 +134,297 @@ func buildIndexKey(conds ...interface{}) string {
 		parts = append(parts, fmt.Sprint(c))
 	}
 	return strings.Join(parts, "|")
+}
+
+// fieldValuePair 联合索引的 (表字段, 字段值) 对
+type fieldValuePair struct {
+	Field string
+	Value string
+}
+
+// parseCondsToFieldValues 从 GORM 风格 conds 解析出 (字段, 值) 列表，用于联合索引。
+// 支持以下几种典型形式：
+//  1. 单条：Find(&game, "anchor_info_id = ?", 123)
+//  2. 多字段：Find(&game, "anchor_info_id = ? and level = ?", 123, 0)
+//  3. 常量 + 占位混合：Find(&game, "anchor_info_id = ? and level = 0", 123)
+func parseCondsToFieldValues(conds ...interface{}) []fieldValuePair {
+	var pairs []fieldValuePair
+	if len(conds) == 0 {
+		return pairs
+	}
+
+	// 目前主要处理第一段 string 条件 + 后续参数的常见写法
+	queryStr, ok := conds[0].(string)
+	if !ok {
+		return pairs
+	}
+	queryStr = strings.TrimSpace(queryStr)
+	if queryStr == "" {
+		return pairs
+	}
+
+	// 归一化空白，便于按 " and " 切分
+	normalized := collapseSpaces(strings.ToLower(queryStr))
+	segments := strings.Split(normalized, " and ")
+	// 保留原始 queryStr 做右值截取，避免大小写影响
+	raw := collapseSpaces(queryStr)
+
+	values := conds[1:]
+	valIdx := 0
+
+	// 用一个游标在 raw 串上同步前进，和 normalized 的 segments 保持结构一致
+	rawRest := raw
+	for _, seg := range segments {
+		seg = strings.TrimSpace(seg)
+		if seg == "" {
+			continue
+		}
+		// 在 rawRest 中找到当前 seg 的位置，以便获得原始片段（含具体常量）
+		pos := strings.Index(strings.ToLower(rawRest), seg)
+		if pos < 0 {
+			continue
+		}
+		part := strings.TrimSpace(rawRest[pos : pos+len(seg)])
+		rawRest = rawRest[pos+len(seg):]
+
+		// 拆分 field = expr
+		idx := strings.Index(part, "=")
+		if idx <= 0 || idx == len(part)-1 {
+			continue
+		}
+		field := strings.TrimSpace(part[:idx])
+		right := strings.TrimSpace(part[idx+1:])
+		if field == "" || right == "" {
+			continue
+		}
+
+		// 右侧以 ? 开头：使用 conds 中的值
+		if right[0] == '?' {
+			if valIdx >= len(values) {
+				continue
+			}
+			value := fmt.Sprint(values[valIdx])
+			valIdx++
+			pairs = append(pairs, fieldValuePair{Field: field, Value: value})
+			continue
+		}
+
+		// 右侧是常量，例如 0 / 1 / 'foo'，直接使用字面量
+		lit := right
+		if strings.HasPrefix(lit, "'") && strings.HasSuffix(lit, "'") && len(lit) >= 2 {
+			lit = lit[1 : len(lit)-1]
+		}
+		pairs = append(pairs, fieldValuePair{Field: field, Value: lit})
+	}
+
+	return pairs
+}
+
+/*
+	旧实现：仅支持 "field = ?" 且一个 conds 对应一个字段，不支持 "level = 0" 这类常量写法。
+	保留注释供参考。
+
+	// 提取所有字段名，例如 "anchor_info_id = ? and level = ?" -> ["anchor_info_id","level"]
+	fields := extractAllFieldNames(queryStr)
+	if len(fields) == 0 {
+		return pairs
+	}
+
+	// 统计 ? 的个数，决定最多能消费多少个值
+	placeholderCount := 0
+	for _, ch := range queryStr {
+		if ch == '?' {
+			placeholderCount++
+		}
+	}
+	// 实际可用的值数量 = min(placeholderCount, len(conds)-1)
+	maxVals := placeholderCount
+	if maxVals > len(conds)-1 {
+		maxVals = len(conds) - 1
+	}
+	if maxVals <= 0 {
+		return pairs
+	}
+
+	// 将前 maxVals 个字段名与 conds[1:maxVals+1] 依次配对
+	for i := 0; i < maxVals && i < len(fields); i++ {
+		field := strings.TrimSpace(fields[i])
+		if field == "" {
+			continue
+		}
+		value := fmt.Sprint(conds[1+i])
+		pairs = append(pairs, fieldValuePair{Field: field, Value: value})
+	}
+
+	return pairs
+}
+*/
+
+// indexAddId 将 id 加入联合索引的 (field, value) 集合，并记录到 indexReverse 与 indexedFields
+func (m *MysqlGts) indexAddId(tableCache *TableCache, id string, pairs []fieldValuePair) {
+	if len(pairs) == 0 {
+		// 没有任何字段时，也至少按主键 ID 建一个索引项
+		if tableCache != nil && tableCache.primaryKey != "" {
+			pairs = append(pairs, fieldValuePair{
+				Field: strings.ToLower(tableCache.primaryKey),
+				Value: id,
+			})
+		} else {
+			return
+		}
+	}
+
+	// 如果传入的 pairs 中没有主键字段，也强制补上一条主键索引，避免只按非主键字段建索引导致后续清理困难
+	if tableCache != nil && tableCache.primaryKey != "" {
+		hasPrimary := false
+		for _, p := range pairs {
+			if p.Field == tableCache.primaryKey {
+				hasPrimary = true
+				break
+			}
+		}
+		if !hasPrimary {
+			pairs = append(pairs, fieldValuePair{
+				Field: strings.ToLower(tableCache.primaryKey),
+				Value: id,
+			})
+		}
+	}
+
+	reverseSet, _ := tableCache.indexReverse.LoadOrStore(id, &sync.Map{})
+	revMap := reverseSet.(*sync.Map)
+	for _, p := range pairs {
+		tableCache.indexedFields.Store(p.Field, struct{}{})
+		fieldMapVal, _ := tableCache.index.LoadOrStore(p.Field, &sync.Map{})
+		fieldMap := fieldMapVal.(*sync.Map)
+		valueSetVal, _ := fieldMap.LoadOrStore(p.Value, &sync.Map{})
+		valueSet := valueSetVal.(*sync.Map)
+		valueSet.Store(id, struct{}{})
+		revMap.Store(p.Field+"|"+p.Value, struct{}{})
+	}
+}
+
+// indexRemoveId 从联合索引中移除该 id 在所有 (field, value) 集合中的记录，并清理 indexReverse
+func (m *MysqlGts) indexRemoveId(tableCache *TableCache, id string) {
+	revVal, ok := tableCache.indexReverse.Load(id)
+	if !ok {
+		return
+	}
+	revMap := revVal.(*sync.Map)
+	revMap.Range(func(k, _ interface{}) bool {
+		keyStr := k.(string)
+		parts := strings.SplitN(keyStr, "|", 2)
+		if len(parts) != 2 {
+			return true
+		}
+		field, valueStr := parts[0], parts[1]
+		fieldMapVal, ok := tableCache.index.Load(field)
+		if !ok {
+			return true
+		}
+		fieldMap := fieldMapVal.(*sync.Map)
+		valueSetVal, ok := fieldMap.Load(valueStr)
+		if !ok {
+			return true
+		}
+		valueSet := valueSetVal.(*sync.Map)
+		valueSet.Delete(id)
+
+		//如果valueSet为空，则删除fieldMap
+
+		empty := true
+		valueSet.Range(func(_, _ interface{}) bool {
+			empty = false
+			return false
+		})
+		if empty {
+			fieldMap.Delete(valueStr)
+		}
+
+		return true
+	})
+	tableCache.indexReverse.Delete(id)
+}
+
+// indexFieldsForId 从 indexReverse 中取出该 id 曾参与过的字段名列表（用于 Update 后重建）
+func (m *MysqlGts) indexFieldsForId(tableCache *TableCache, id string) []string {
+	revVal, ok := tableCache.indexReverse.Load(id)
+	if !ok {
+		return nil
+	}
+	revMap := revVal.(*sync.Map)
+	seen := make(map[string]struct{})
+	var fields []string
+	revMap.Range(func(k, _ interface{}) bool {
+		keyStr := k.(string)
+		idx := strings.Index(keyStr, "|")
+		if idx > 0 {
+			field := keyStr[:idx]
+			if _, ok := seen[field]; !ok {
+				seen[field] = struct{}{}
+				fields = append(fields, field)
+			}
+		}
+		return true
+	})
+	return fields
+}
+
+// indexRebuildForId 根据 model 当前字段值，将该 id 重新加入联合索引（Update 后调用）
+func (m *MysqlGts) indexRebuildForId(tableCache *TableCache, id string, model interface{}, fields []string) {
+	if len(fields) == 0 {
+		return
+	}
+	pairs := make([]fieldValuePair, 0, len(fields))
+	for _, f := range fields {
+		v := m.getFieldValue(model, f, tableCache)
+		pairs = append(pairs, fieldValuePair{Field: f, Value: v})
+	}
+	m.indexAddId(tableCache, id, pairs)
+}
+
+// indexLookupIds 多条件取交集：根据 (field, value) 列表从联合索引查出 id 集合（交集）
+func (m *MysqlGts) indexLookupIds(tableCache *TableCache, pairs []fieldValuePair) []string {
+	if len(pairs) == 0 {
+		return nil
+	}
+	var intersect []string
+	for i, p := range pairs {
+		fieldMapVal, ok := tableCache.index.Load(p.Field)
+		if !ok {
+			return nil
+		}
+		fieldMap := fieldMapVal.(*sync.Map)
+		valueSetVal, ok := fieldMap.Load(p.Value)
+		if !ok {
+			return nil
+		}
+		valueSet := valueSetVal.(*sync.Map)
+		var ids []string
+		valueSet.Range(func(k, _ interface{}) bool {
+			ids = append(ids, k.(string))
+			return true
+		})
+		if i == 0 {
+			intersect = ids
+		} else {
+			set := make(map[string]struct{})
+			for _, id := range intersect {
+				set[id] = struct{}{}
+			}
+			var next []string
+			for _, id := range ids {
+				if _, ok := set[id]; ok {
+					next = append(next, id)
+				}
+			}
+			intersect = next
+		}
+		if len(intersect) == 0 {
+			return nil
+		}
+	}
+	return intersect
 }
 
 // SetSyncInterval 设置同步间隔（秒）
@@ -227,8 +522,10 @@ func (m *MysqlGts) cacheReflectInfo(model interface{}, primaryKey string) *Model
 	return info
 }
 
-// Load 加载整表数据到缓存
-func (m *MysqlGts) Load(model interface{}) error {
+// Load 加载数据到缓存；可选传入查询条件。
+// 传入条件时，按条件从数据库加载并写入缓存。
+// 未传入条件时，若 model 带有主键 ID 则按主键查询加载该条，否则加载整表。
+func (m *MysqlGts) Load(model interface{}, conds ...interface{}) error {
 	tableName, err := m.getTableName(model)
 	if err != nil {
 		return fmt.Errorf("获取表名失败: %v", err)
@@ -242,7 +539,15 @@ func (m *MysqlGts) Load(model interface{}) error {
 		return fmt.Errorf("表 %s 未初始化，请先调用 InitTable", tableName)
 	}
 
-	// 从数据库加载数据
+	// 未传入条件时，使用唯一主键 ID 查询（若 model 有主键值）
+	if len(conds) == 0 {
+		id := m.getIDValue(model, tableCache.primaryKey, tableCache)
+		if id != "" && id != "0" {
+			conds = []interface{}{tableCache.primaryKey + " = ?", id}
+		}
+	}
+
+	// 从数据库加载数据（复用 FindFromDB 的查询与回写缓存逻辑）
 	modelType := reflect.TypeOf(model)
 	if modelType.Kind() == reflect.Ptr {
 		modelType = modelType.Elem()
@@ -253,22 +558,8 @@ func (m *MysqlGts) Load(model interface{}) error {
 	sliceValue := reflect.New(sliceType)
 	slice := sliceValue.Interface()
 
-	// 查询所有数据
-	if err := m.db.Find(slice).Error; err != nil {
+	if err := m.FindFromDB(slice, conds...); err != nil {
 		return fmt.Errorf("加载表数据失败: %v", err)
-	}
-
-	// 将数据存入缓存（使用行锁 + sync.Map，避免表级锁）
-	sliceVal := reflect.ValueOf(slice).Elem()
-	for i := 0; i < sliceVal.Len(); i++ {
-		item := sliceVal.Index(i).Interface()
-		id := m.getIDValue(item, tableCache.primaryKey, tableCache)
-		if id != "" && id != "0" {
-			rowLock := tableCache.getRowLock(id)
-			rowLock.Lock()
-			tableCache.data.Store(id, item)
-			rowLock.Unlock()
-		}
 	}
 
 	tableCache.mu.Lock()
@@ -279,9 +570,24 @@ func (m *MysqlGts) Load(model interface{}) error {
 
 // First 查询第一条记录
 func (m *MysqlGts) First(model interface{}, conds ...interface{}) error {
+	// 先尝试从缓存中查询
+	found, err := m.FirstFromCache(model, conds...)
+	if err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	// 缓存未命中，再从数据库查询并写回缓存
+	return m.FirstFromDB(model, conds...)
+}
+
+// FirstFromCache 仅从缓存中查询第一条记录（不访问数据库）
+// 返回值 found 表示是否在缓存中命中记录
+func (m *MysqlGts) FirstFromCache(model interface{}, conds ...interface{}) (found bool, err error) {
 	tableName, err := m.getTableName(model)
 	if err != nil {
-		return fmt.Errorf("获取表名失败: %v", err)
+		return false, fmt.Errorf("获取表名失败: %v", err)
 	}
 
 	m.mu.RLock()
@@ -289,7 +595,7 @@ func (m *MysqlGts) First(model interface{}, conds ...interface{}) error {
 	m.mu.RUnlock()
 
 	if !exists {
-		return fmt.Errorf("表 %s 未初始化，请先调用 InitTable", tableName)
+		return false, fmt.Errorf("表 %s 未初始化，请先调用 InitTable", tableName)
 	}
 
 	// 如果缓存未加载，先加载
@@ -298,34 +604,13 @@ func (m *MysqlGts) First(model interface{}, conds ...interface{}) error {
 	tableCache.mu.RUnlock()
 
 	if !loaded {
-		if err := m.Load(model); err != nil {
-			return err
+		if err := m.Load(model, conds...); err != nil {
+			return false, err
+		} else {
+			// fmt.Println("缓存未命中，但加载成功")
 		}
 	}
-
-	// 预先构建条件索引 key，便于后续使用二级索引加速查找
-	indexKey := ""
-	if len(conds) > 0 {
-		indexKey = buildIndexKey(conds...)
-	}
-
-	// 1. 最先尝试从二级索引中命中（避免全表遍历/复杂匹配）
-	if indexKey != "" {
-		if v, ok := tableCache.index.Load(indexKey); ok {
-			if idStr, ok2 := v.(string); ok2 && idStr != "" {
-				rowLock := tableCache.getRowLock(idStr)
-				rowLock.RLock()
-				if cached, ok3 := tableCache.data.Load(idStr); ok3 {
-					err := m.copyModel(cached, model)
-					rowLock.RUnlock()
-					return err
-				}
-				rowLock.RUnlock()
-			}
-		}
-	}
-
-	// 2. 然后处理常见的按主键 ID 查询的简单场景：
+	// 1. 然后处理常见的按主键 ID 查询的简单场景：
 	//   First(model, "id = ?", id)
 	// 这种情况可以直接通过主键命中，避免遍历整个表和反射匹配。
 	if len(conds) > 0 {
@@ -338,9 +623,10 @@ func (m *MysqlGts) First(model interface{}, conds ...interface{}) error {
 					rowLock := tableCache.getRowLock(idStr)
 					rowLock.RLock()
 					if cached, ok := tableCache.data.Load(idStr); ok {
+						// fmt.Println("通过主键命中", cached)
 						err := m.copyModel(cached, model)
 						rowLock.RUnlock()
-						return err
+						return true, err
 					}
 					rowLock.RUnlock()
 				}
@@ -348,9 +634,29 @@ func (m *MysqlGts) First(model interface{}, conds ...interface{}) error {
 		}
 	}
 
+	// 2. 联合二级索引：多条件取交集，取第一条
+	pairs := parseCondsToFieldValues(conds...)
+	if len(pairs) > 0 {
+		ids := m.indexLookupIds(tableCache, pairs)
+		if len(ids) > 0 {
+			idStr := ids[0]
+			rowLock := tableCache.getRowLock(idStr)
+			rowLock.RLock()
+			if cached, ok := tableCache.data.Load(idStr); ok {
+				err := m.copyModel(cached, model)
+				rowLock.RUnlock()
+				if err == nil {
+					m.indexAddId(tableCache, idStr, pairs)
+				}
+				return true, err
+			}
+			rowLock.RUnlock()
+		}
+	}
+
 	// 从缓存中查找（只使用行锁 + sync.Map，不使用表级锁），按条件遍历匹配
 	var foundItem interface{}
-	found := false
+	found = false
 	// 如果有查询条件，需要匹配
 	if len(conds) > 0 {
 		// 简单的条件匹配（可以根据需要扩展）
@@ -362,9 +668,6 @@ func (m *MysqlGts) First(model interface{}, conds ...interface{}) error {
 			}
 			return true
 		})
-		if !found {
-			// fmt.Printf("[First] 缓存中未找到匹配记录\n")
-		}
 	} else {
 		// 没有条件，返回第一条
 		tableCache.data.Range(func(_, v interface{}) bool {
@@ -373,6 +676,9 @@ func (m *MysqlGts) First(model interface{}, conds ...interface{}) error {
 			return false
 		})
 	}
+
+	// fmt.Println("found：%V", found)
+	// fmt.Println("foundItem：%V", foundItem)
 
 	// 如果缓存中找到，使用行级读锁来安全地复制数据
 	if found {
@@ -384,57 +690,44 @@ func (m *MysqlGts) First(model interface{}, conds ...interface{}) error {
 			rowLock.RLock()
 			err := m.copyModel(foundItem, model)
 			rowLock.RUnlock()
-			// 命中后更新二级索引，后续可直接通过 indexKey + 主键 ID 加速
-			if indexKey != "" {
-				tableCache.index.Store(indexKey, foundID)
+			// 命中后回写联合二级索引
+			if len(pairs) > 0 {
+				m.indexAddId(tableCache, foundID, pairs)
 			}
-			return err
+			return true, err
 		}
-		return m.copyModel(foundItem, model)
+		return true, m.copyModel(foundItem, model)
 	}
 
-	// 缓存中没找到，去数据库查询
-	query := m.db.Model(model)
-	if len(conds) > 0 {
-		// 处理查询条件
-		// GORM 风格的查询条件：第一个参数是查询字符串，后续参数是值
-		if queryStr, ok := conds[0].(string); ok {
-			// 统计查询字符串中 ? 的数量
-			placeholderCount := 0
-			for _, char := range queryStr {
-				if char == '?' {
-					placeholderCount++
-				}
-			}
+	// 缓存未命中
+	return false, nil
+}
 
-			// 如果查询字符串包含占位符，需要传递相应数量的参数
-			if placeholderCount > 0 {
-				if len(conds) > placeholderCount {
-					// 传递所有参数值
-					query = query.Where(queryStr, conds[1:1+placeholderCount]...)
-				} else if len(conds) == placeholderCount+1 {
-					// 参数数量刚好匹配
-					query = query.Where(queryStr, conds[1:]...)
-				} else {
-					// 参数不足，只传递已有的参数
-					query = query.Where(queryStr, conds[1:]...)
-				}
-			} else {
-				// 没有占位符，直接使用查询字符串
-				query = query.Where(queryStr)
-			}
-		} else {
-			// 第一个参数不是字符串，可能是主键值
-			query = query.Where(conds[0])
-		}
+// FirstFromDB 仅从数据库查询第一条记录，并回填到缓存中
+func (m *MysqlGts) FirstFromDB(model interface{}, conds ...interface{}) error {
+	tableName, err := m.getTableName(model)
+	if err != nil {
+		return fmt.Errorf("获取表名失败: %v", err)
 	}
+
+	m.mu.RLock()
+	tableCache, exists := m.tables[tableName]
+	m.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("表 %s 未初始化，请先调用 InitTable", tableName)
+	}
+
+	pairs := parseCondsToFieldValues(conds...)
 
 	// 从数据库查询
+	query := m.buildQuery(model, conds...)
+
 	if err := query.First(model).Error; err != nil {
 		return err
 	}
 
-	// 查询成功，将结果添加到缓存
+	// 查询成功，将结果添加到缓存并更新联合二级索引
 	id := m.getIDValue(model, tableCache.primaryKey, tableCache)
 	if id != "" && id != "0" {
 		// 获取行级写锁
@@ -450,10 +743,7 @@ func (m *MysqlGts) First(model interface{}, conds ...interface{}) error {
 		cachedItem := reflect.New(modelType).Interface()
 		if err := m.copyModel(model, cachedItem); err == nil {
 			tableCache.data.Store(id, cachedItem)
-			// 同步更新二级索引
-			if indexKey != "" {
-				tableCache.index.Store(indexKey, id)
-			}
+			m.indexAddId(tableCache, id, pairs)
 		}
 	}
 
@@ -462,9 +752,24 @@ func (m *MysqlGts) First(model interface{}, conds ...interface{}) error {
 
 // Find 查询多条记录
 func (m *MysqlGts) Find(dest interface{}, conds ...interface{}) error {
+	// 先尝试从缓存中查询
+	found, err := m.FindFromCache(dest, conds...)
+	if err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	// 缓存未命中，再从数据库查询并写回缓存
+	return m.FindFromDB(dest, conds...)
+}
+
+// FindFromCache 仅从缓存中查询多条记录（不访问数据库）
+// 返回值 found 表示是否在缓存中命中至少一条记录
+func (m *MysqlGts) FindFromCache(dest interface{}, conds ...interface{}) (found bool, err error) {
 	tableName, err := m.getTableNameFromDest(dest)
 	if err != nil {
-		return fmt.Errorf("获取表名失败: %v", err)
+		return false, fmt.Errorf("获取表名失败: %v", err)
 	}
 
 	m.mu.RLock()
@@ -472,7 +777,7 @@ func (m *MysqlGts) Find(dest interface{}, conds ...interface{}) error {
 	m.mu.RUnlock()
 
 	if !exists {
-		return fmt.Errorf("表 %s 未初始化，请先调用 InitTable", tableName)
+		return false, fmt.Errorf("表 %s 未初始化，请先调用 InitTable", tableName)
 	}
 
 	// 需要从 dest 中获取模型类型
@@ -489,16 +794,42 @@ func (m *MysqlGts) Find(dest interface{}, conds ...interface{}) error {
 	tableCache.mu.RUnlock()
 
 	if !loaded {
-		if err := m.Load(model); err != nil {
-			return err
+		if err := m.Load(model, conds...); err != nil {
+			return false, err
+		} else {
 		}
 	}
 
+	// 联合二级索引：多条件取交集
+	pairs := parseCondsToFieldValues(conds...)
+	indexHitIds := make(map[string]struct{})
 	var cachedResults []interface{}
-	// 遍历 sync.Map 匹配条件
+	if len(pairs) > 0 {
+		ids := m.indexLookupIds(tableCache, pairs)
+		for _, idStr := range ids {
+			rowLock := tableCache.getRowLock(idStr)
+			rowLock.RLock()
+			if cached, ok := tableCache.data.Load(idStr); ok {
+				if len(conds) == 0 || m.matchConditions(cached, conds) {
+					cachedResults = append(cachedResults, cached)
+					indexHitIds[idStr] = struct{}{}
+				}
+			}
+			rowLock.RUnlock()
+		}
+	}
+
+	// 遍历 sync.Map 匹配条件（跳过已从联合索引命中的 id，避免重复）
 	tableCache.data.Range(func(_, v interface{}) bool {
+		id := m.getIDValue(v, tableCache.primaryKey, tableCache)
+		if _, skip := indexHitIds[id]; skip {
+			return true
+		}
 		if len(conds) == 0 || m.matchConditions(v, conds) {
 			cachedResults = append(cachedResults, v)
+			if len(pairs) > 0 {
+				m.indexAddId(tableCache, id, pairs)
+			}
 		}
 		return true
 	})
@@ -522,56 +853,47 @@ func (m *MysqlGts) Find(dest interface{}, conds ...interface{}) error {
 		destValue.Set(reflect.Append(destValue, elemValue))
 	}
 
-	// 如果缓存中有结果，直接返回（不再查询数据库）
-	// 如果需要查询数据库，可以取消下面的注释
-	// 但通常缓存加载后，所有数据都在缓存中，所以这里先返回缓存结果
-	// 如果缓存结果为空，再去数据库查询
 	if len(cachedResults) > 0 {
-		return nil
+		return true, nil
 	}
 
-	// 缓存中没找到，去数据库查询
-	query := m.db.Model(model)
-	if len(conds) > 0 {
-		// 处理查询条件
-		// GORM 风格的查询条件：第一个参数是查询字符串，后续参数是值
-		if queryStr, ok := conds[0].(string); ok {
-			// 统计查询字符串中 ? 的数量
-			placeholderCount := 0
-			for _, char := range queryStr {
-				if char == '?' {
-					placeholderCount++
-				}
-			}
+	// 缓存未命中
+	return false, nil
+}
 
-			// 如果查询字符串包含占位符，需要传递相应数量的参数
-			if placeholderCount > 0 {
-				if len(conds) > placeholderCount {
-					// 传递所有参数值
-					query = query.Where(queryStr, conds[1:1+placeholderCount]...)
-				} else if len(conds) == placeholderCount+1 {
-					// 参数数量刚好匹配
-					query = query.Where(queryStr, conds[1:]...)
-				} else {
-					// 参数不足，只传递已有的参数
-					query = query.Where(queryStr, conds[1:]...)
-				}
-			} else {
-				// 没有占位符，直接使用查询字符串
-				query = query.Where(queryStr)
-			}
-		} else {
-			// 第一个参数不是字符串，可能是主键值
-			query = query.Where(conds[0])
-		}
+// FindFromDB 仅从数据库查询多条记录，并回填到缓存中
+func (m *MysqlGts) FindFromDB(dest interface{}, conds ...interface{}) error {
+	tableName, err := m.getTableNameFromDest(dest)
+	if err != nil {
+		return fmt.Errorf("获取表名失败: %v", err)
 	}
+
+	m.mu.RLock()
+	tableCache, exists := m.tables[tableName]
+	m.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("表 %s 未初始化，请先调用 InitTable", tableName)
+	}
+
+	// 需要从 dest 中获取模型类型
+	destType := reflect.TypeOf(dest).Elem()
+	modelType := destType.Elem()
+	if modelType.Kind() == reflect.Ptr {
+		modelType = modelType.Elem()
+	}
+	model := reflect.New(modelType).Interface()
+
+	pairs := parseCondsToFieldValues(conds...)
 
 	// 从数据库查询
+	query := m.buildQuery(model, conds...)
+
 	if err := query.Find(dest).Error; err != nil {
 		return err
 	}
 
-	// 查询成功，将结果添加到缓存
+	// 查询成功，将结果添加到缓存并更新联合二级索引
 	destVal := reflect.ValueOf(dest).Elem()
 	for i := 0; i < destVal.Len(); i++ {
 		item := destVal.Index(i).Interface()
@@ -586,12 +908,54 @@ func (m *MysqlGts) Find(dest interface{}, conds ...interface{}) error {
 			if err := m.copyModel(item, cachedItem); err == nil {
 				tableCache.data.Store(id, cachedItem)
 			}
+			m.indexAddId(tableCache, id, pairs)
 
 			rowLock.Unlock()
 		}
 	}
 
 	return nil
+}
+
+// buildQuery 根据传入的模型和条件构造 GORM 查询（统一处理占位符与参数数量）
+func (m *MysqlGts) buildQuery(model interface{}, conds ...interface{}) *gorm.DB {
+	query := m.db.Model(model)
+	if len(conds) == 0 {
+		return query
+	}
+
+	// 处理查询条件
+	// GORM 风格的查询条件：第一个参数是查询字符串，后续参数是值
+	if queryStr, ok := conds[0].(string); ok {
+		// 统计查询字符串中 ? 的数量
+		placeholderCount := 0
+		for _, char := range queryStr {
+			if char == '?' {
+				placeholderCount++
+			}
+		}
+
+		// 如果查询字符串包含占位符，需要传递相应数量的参数
+		if placeholderCount > 0 {
+			if len(conds) > placeholderCount {
+				// 传递所有参数值
+				query = query.Where(queryStr, conds[1:1+placeholderCount]...)
+			} else if len(conds) == placeholderCount+1 {
+				// 参数数量刚好匹配
+				query = query.Where(queryStr, conds[1:]...)
+			} else {
+				// 参数不足，只传递已有的参数
+				query = query.Where(queryStr, conds[1:]...)
+			}
+		} else {
+			// 没有占位符，直接使用查询字符串
+			query = query.Where(queryStr)
+		}
+	} else {
+		// 第一个参数不是字符串，可能是主键值
+		query = query.Where(conds[0])
+	}
+	return query
 }
 
 // Update 更新记录
@@ -616,6 +980,7 @@ func (m *MysqlGts) Update(model interface{}, values map[string]interface{}) erro
 	tableCache.mu.RUnlock()
 
 	if !loaded {
+		// 无条件时 Load 内部会按 model 的主键 ID 查询
 		if err := m.Load(model); err != nil {
 			return err
 		}
@@ -625,7 +990,6 @@ func (m *MysqlGts) Update(model interface{}, values map[string]interface{}) erro
 	if id == "" {
 		return errors.New("无法获取主键 ID")
 	}
-
 	// 获取行级锁
 	rowLock := tableCache.getRowLock(id)
 	rowLock.Lock()
@@ -637,7 +1001,6 @@ func (m *MysqlGts) Update(model interface{}, values map[string]interface{}) erro
 		return gorm.ErrRecordNotFound
 	}
 	item := v
-
 	// 更新数据（使用缓存的反射信息）
 	itemValue := reflect.ValueOf(item).Elem()
 	for key, value := range values {
@@ -650,6 +1013,11 @@ func (m *MysqlGts) Update(model interface{}, values map[string]interface{}) erro
 
 	// 使用行级锁 + sync.Map 更新 data
 	tableCache.data.Store(id, item)
+
+	// 重建二级索引：先取出该 id 曾参与的字段名，移除旧索引，再按当前 model 回填
+	fields := m.indexFieldsForId(tableCache, id)
+	m.indexRemoveId(tableCache, id)
+	m.indexRebuildForId(tableCache, id, item, fields)
 
 	// 记录操作日志
 	m.recordOperation(tableName, "update", id, item)
@@ -678,7 +1046,8 @@ func (m *MysqlGts) Delete(model interface{}, conds ...interface{}) error {
 	tableCache.mu.RUnlock()
 
 	if !loaded {
-		if err := m.Load(model); err != nil {
+		// 传入 conds 则按条件加载；否则 Load 内部会按 model 的主键 ID 查询
+		if err := m.Load(model, conds...); err != nil {
 			return err
 		}
 	}
@@ -718,8 +1087,9 @@ func (m *MysqlGts) Delete(model interface{}, conds ...interface{}) error {
 
 	for _, id := range toDelete {
 		tableCache.data.Delete(id)
-		// 清理行级锁（可选，sync.Map 会自动管理）
 		tableCache.rowLocks.Delete(id)
+		// 仅移除被删除记录对应的二级索引，避免整表重建带来的性能开销
+		m.indexRemoveId(tableCache, id)
 	}
 
 	// 记录操作日志
@@ -1061,10 +1431,12 @@ var notSyncType = reflect.TypeOf(NotSyncToDatabase(false))
 
 // shouldSkipOperationLog 判断模型是否声明了 NotSyncToDatabase 并且为 true
 // 约定：在模型中匿名嵌入 gts.NotSyncToDatabase，例如：
-//   type FigureAttribute struct {
-//       ...
-//       gts.NotSyncToDatabase `json:"-"`
-//   }
+//
+//	type FigureAttribute struct {
+//	    ...
+//	    gts.NotSyncToDatabase `json:"-"`
+//	}
+//
 // 当该布尔值为 true 时，不记录该模型的 OperationLog。
 func shouldSkipOperationLog(model interface{}) bool {
 	v := reflect.ValueOf(model)
@@ -1194,6 +1566,20 @@ func (m *MysqlGts) getIDValue(model interface{}, primaryKey string, tableCache *
 	return ""
 }
 
+// getFieldValue 根据表字段名（如 user_info_id）从 model 中取当前值，返回字符串，用于重建二级索引
+func (m *MysqlGts) getFieldValue(model interface{}, fieldName string, tableCache *TableCache) string {
+	modelValue := reflect.ValueOf(model)
+	if modelValue.Kind() == reflect.Ptr {
+		modelValue = modelValue.Elem()
+	}
+	camelName := m.toCamelCase(fieldName, tableCache)
+	field := modelValue.FieldByName(camelName)
+	if !field.IsValid() {
+		return ""
+	}
+	return fmt.Sprint(field.Interface())
+}
+
 // setIDValue 设置主键值
 func (m *MysqlGts) setIDValue(model interface{}, primaryKey, id string) error {
 	modelValue := reflect.ValueOf(model)
@@ -1303,62 +1689,90 @@ func (m *MysqlGts) matchConditions(item interface{}, conds []interface{}) bool {
 			}
 		}
 
-		// 情况2: 查询条件字符串，例如 "id = ?" 或 "user_info_id = ? AND card_id = ?"
+		// 情况2: 查询条件字符串，例如：
+		//   "id = ?"
+		//   "user_info_id = ? AND card_id = ?"
+		//   "anchor_info_id = ? and level = 0"
 		if queryStr, ok := cond.(string); ok {
-			// fmt.Println("queryStr=", queryStr)
-			// 检查是否包含 "=" 和 "?"
-			if containsSubstring(queryStr, "=") && containsSubstring(queryStr, "?") {
-				fieldNames := extractAllFieldNames(queryStr)
-				// fmt.Println("fieldNames=", fieldNames)
-				numValues := len(fieldNames)
-				// fmt.Println("numValues=", numValues)
-				// fmt.Println("i=", i)
-				// fmt.Println("conds=", conds)
-				if numValues == 0 || i+numValues > len(conds) {
-					// fmt.Println("numValues == 0 || i+numValues > len(conds)")
+			qs := strings.TrimSpace(queryStr)
+			if qs == "" || !containsSubstring(qs, "=") {
+				continue
+			}
+
+			// 归一化空白并按 AND 拆分子条件
+			normalized := collapseSpaces(strings.ToLower(qs))
+			segments := strings.Split(normalized, " and ")
+			raw := collapseSpaces(qs)
+
+			values := conds[i+1:]
+			valIdx := 0
+			rawRest := raw
+
+			for _, seg := range segments {
+				seg = strings.TrimSpace(seg)
+				if seg == "" {
+					continue
+				}
+				// 在 rawRest 中找到当前 seg 的原始片段
+				pos := strings.Index(strings.ToLower(rawRest), seg)
+				if pos < 0 {
 					return false
 				}
-				// fmt.Println("fieldNames=", fieldNames)
-				// fmt.Println("numValues=", numValues)
-				// 查询参数从 conds[i+1] 起，共 numValues 个
-				valueStart := i + 1
-				// fmt.Println("valueStart=", valueStart)
-				i += numValues // 本轮消耗掉后面的值参数
-				// fmt.Println("i=", i)
-				// 多条件：所有字段都需匹配
-				for j, fieldName := range fieldNames {
-					value := conds[valueStart+j]
-					//	fmt.Println("value=", value)
-					camelFieldName := m.toCamelCase(fieldName, tableCache)
-					//fmt.Println("camelFieldName=", camelFieldName)
-					field := itemValue.FieldByName(camelFieldName)
-					//fmt.Println("field=", field)
-					if !field.IsValid() {
-						return false
-					}
-					fieldValue := field.Interface()
-					//fmt.Println("fieldValue=", fieldValue)
-					fieldValueKind := field.Kind()
-					valueKind := reflect.TypeOf(value).Kind()
-					//fmt.Println("fieldValueKind=", fieldValueKind)
-					//fmt.Println("valueKind=", valueKind)
-					var equal bool
-					if fieldValueKind != valueKind {
-						fieldValueStr := fmt.Sprintf("%v", fieldValue)
-						valueStr := fmt.Sprintf("%v", value)
-						equal = (fieldValueStr == valueStr)
-						//fmt.Println("equal=", equal)
-					} else {
-						equal = reflect.DeepEqual(fieldValue, value)
-						//fmt.Println("equal=", equal)
-					}
-					if !equal {
-						return false
-					}
+				part := strings.TrimSpace(rawRest[pos : pos+len(seg)])
+				rawRest = rawRest[pos+len(seg):]
+
+				// 拆分 field = expr
+				idxEq := strings.Index(part, "=")
+				if idxEq <= 0 || idxEq == len(part)-1 {
+					return false
 				}
-				// 所有条件都匹配
-				return true
+				fieldName := strings.TrimSpace(part[:idxEq])
+				right := strings.TrimSpace(part[idxEq+1:])
+				if fieldName == "" || right == "" {
+					return false
+				}
+
+				// 找到对应字段
+				camelFieldName := m.toCamelCase(fieldName, tableCache)
+				field := itemValue.FieldByName(camelFieldName)
+				if !field.IsValid() {
+					return false
+				}
+				fieldValue := field.Interface()
+
+				var want interface{}
+				// 右侧以 ? 开头：从 conds 取值
+				if len(right) > 0 && right[0] == '?' {
+					if valIdx >= len(values) {
+						return false
+					}
+					want = values[valIdx]
+					valIdx++
+				} else {
+					// 常量：直接用字符串字面值（去掉成对单引号）
+					lit := right
+					if strings.HasPrefix(lit, "'") && strings.HasSuffix(lit, "'") && len(lit) >= 2 {
+						lit = lit[1 : len(lit)-1]
+					}
+					want = lit
+				}
+
+				// 比较 fieldValue 与 want
+				fk := reflect.TypeOf(fieldValue).Kind()
+				vk := reflect.TypeOf(want).Kind()
+				equal := false
+				if fk != vk {
+					equal = fmt.Sprintf("%v", fieldValue) == fmt.Sprintf("%v", want)
+				} else {
+					equal = reflect.DeepEqual(fieldValue, want)
+				}
+				if !equal {
+					return false
+				}
 			}
+
+			// 所有子条件都匹配
+			return true
 		}
 	}
 
@@ -1661,11 +2075,91 @@ func (m *MysqlGts) ClearCache(tableName string) error {
 	tableCache.loaded = false
 	tableCache.mu.Unlock()
 
-	// 清空 sync.Map
+	// 清空 data
 	tableCache.data.Range(func(k, _ interface{}) bool {
 		tableCache.data.Delete(k)
 		return true
 	})
 
+	// 清空联合二级索引及已索引字段记录
+	tableCache.index.Range(func(k, _ interface{}) bool {
+		tableCache.index.Delete(k)
+		return true
+	})
+	tableCache.indexReverse.Range(func(k, _ interface{}) bool {
+		tableCache.indexReverse.Delete(k)
+		return true
+	})
+	tableCache.indexedFields.Range(func(k, _ interface{}) bool {
+		tableCache.indexedFields.Delete(k)
+		return true
+	})
+
 	return nil
+}
+
+// DebugPrintTableIndex 打印指定表的二级索引（仅用于调试）
+func (m *MysqlGts) DebugPrintTableIndex(tableName string) {
+	m.mu.RLock()
+	tableCache, exists := m.tables[tableName]
+	m.mu.RUnlock()
+	if !exists {
+		fmt.Printf("[GTS][Index] table %s not found\n", tableName)
+		return
+	}
+
+	fmt.Printf("[GTS][Index] table=%s\n", tableName)
+	tableCache.index.Range(func(fieldKey, fieldVal interface{}) bool {
+		fieldName, ok := fieldKey.(string)
+		if !ok {
+			return true
+		}
+		valueMap, ok := fieldVal.(*sync.Map)
+		if !ok {
+			return true
+		}
+		valueMap.Range(func(vKey, vVal interface{}) bool {
+			valueStr, ok := vKey.(string)
+			if !ok {
+				return true
+			}
+			idSet, ok := vVal.(*sync.Map)
+			if !ok {
+				return true
+			}
+			ids := make([]string, 0)
+			idSet.Range(func(idKey, _ interface{}) bool {
+				if idStr, ok := idKey.(string); ok {
+					ids = append(ids, idStr)
+				}
+				return true
+			})
+			fmt.Printf("  field=%s value=%s ids=%v\n", fieldName, valueStr, ids)
+			return true
+		})
+		return true
+	})
+}
+
+// DebugPrintTableData 打印指定表的所有缓存数据（仅用于调试）
+func (m *MysqlGts) DebugPrintTableData(tableName string) {
+	m.mu.RLock()
+	tableCache, exists := m.tables[tableName]
+	m.mu.RUnlock()
+	if !exists {
+		fmt.Printf("[GTS][Data] table %s not found\n", tableName)
+		return
+	}
+
+	fmt.Printf("[GTS][Data] table=%s\n", tableName)
+	tableCache.data.Range(func(idKey, val interface{}) bool {
+		idStr, ok := idKey.(string)
+		if !ok {
+			return true
+		}
+		// 使用 modelToMap 将结构体转为 map 便于阅读
+		dataMap := m.modelToMap(val)
+		fmt.Printf("  id=%s data=%v\n", idStr, dataMap)
+		return true
+	})
 }
