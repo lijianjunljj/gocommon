@@ -55,14 +55,14 @@ type TableName interface {
 
 // MysqlGts MySQL 内存表管理工具，类似 Erlang ETS
 type MysqlGts struct {
-	db           *gorm.DB                   // GORM 数据库实例
-	tables       map[string]*TableCache     // 表缓存，key 为表名
-	opLogs       map[string][]*OperationLog // 操作日志，key 为表名
-	mu           sync.RWMutex               // 读写锁
-	syncInterval time.Duration              // 同步间隔（秒）
-	batchSize    int                        // 每次处理的操作日志数量
-	stopChan     chan struct{}              // 停止信号
-	syncRunning  bool                       // 同步是否正在运行
+	db           *gorm.DB               // GORM 数据库实例
+	tables       map[string]*TableCache // 表缓存，key 为表名
+	opLogsMap    sync.Map               // 每表一个无锁队列：key=表名(string), value=*tableOpLogQueue，recordOperation 只锁当前表
+	mu           sync.RWMutex           // 读写锁（仅保护 tables，不再保护 opLogs）
+	syncInterval time.Duration          // 同步间隔（秒）
+	batchSize    int                    // 每次处理的操作日志数量
+	stopChan     chan struct{}          // 停止信号
+	syncRunning  bool                   // 同步是否正在运行
 }
 
 // ModelReflectInfo 模型反射信息缓存
@@ -109,13 +109,18 @@ type OperationLog struct {
 	Timestamp time.Time              // 操作时间
 }
 
+// tableOpLogQueue 单表操作日志队列，仅本表加锁，减少与其它表的竞争
+type tableOpLogQueue struct {
+	mu   sync.Mutex
+	logs []*OperationLog
+}
+
 // NewMysqlGts 创建新的 MysqlGts 实例
 func NewMysqlGts(db *gorm.DB) *MysqlGts {
 	return &MysqlGts{
 		db:           db,
 		tables:       make(map[string]*TableCache),
-		opLogs:       make(map[string][]*OperationLog),
-		syncInterval: 1 * time.Second, // 默认 5 秒同步一次
+		syncInterval: 1 * time.Second, // 默认 1 秒同步一次
 		batchSize:    100,             // 默认每次处理 100 条
 		stopChan:     make(chan struct{}),
 		syncRunning:  false,
@@ -472,8 +477,6 @@ func (m *MysqlGts) InitTable(models ...interface{}) error {
 			reflectInfo: reflectInfo,
 		}
 
-		// 初始化操作日志
-		m.opLogs[tableName] = make([]*OperationLog, 0)
 	}
 
 	return nil
@@ -645,9 +648,6 @@ func (m *MysqlGts) FirstFromCache(model interface{}, conds ...interface{}) (foun
 			if cached, ok := tableCache.data.Load(idStr); ok {
 				err := m.copyModel(cached, model)
 				rowLock.RUnlock()
-				if err == nil {
-					m.indexAddId(tableCache, idStr, pairs)
-				}
 				return true, err
 			}
 			rowLock.RUnlock()
@@ -657,11 +657,18 @@ func (m *MysqlGts) FirstFromCache(model interface{}, conds ...interface{}) (foun
 	// 从缓存中查找（只使用行锁 + sync.Map，不使用表级锁），按条件遍历匹配
 	var foundItem interface{}
 	found = false
+	compiled := m.compileConds(conds, tableCache)
 	// 如果有查询条件，需要匹配
 	if len(conds) > 0 {
 		// 简单的条件匹配（可以根据需要扩展）
 		tableCache.data.Range(func(_, v interface{}) bool {
-			if m.matchConditions(v, conds) {
+			if compiled != nil {
+				if m.matchConditionsCompiled(v, compiled, tableCache) {
+					foundItem = v
+					found = true
+					return false
+				}
+			} else if m.matchConditions(v, conds, tableCache) {
 				foundItem = v
 				found = true
 				return false
@@ -802,6 +809,7 @@ func (m *MysqlGts) FindFromCache(dest interface{}, conds ...interface{}) (found 
 
 	// 联合二级索引：多条件取交集
 	pairs := parseCondsToFieldValues(conds...)
+	compiled := m.compileConds(conds, tableCache)
 	indexHitIds := make(map[string]struct{})
 	var cachedResults []interface{}
 	if len(pairs) > 0 {
@@ -810,7 +818,15 @@ func (m *MysqlGts) FindFromCache(dest interface{}, conds ...interface{}) (found 
 			rowLock := tableCache.getRowLock(idStr)
 			rowLock.RLock()
 			if cached, ok := tableCache.data.Load(idStr); ok {
-				if len(conds) == 0 || m.matchConditions(cached, conds) {
+				if len(conds) == 0 {
+					cachedResults = append(cachedResults, cached)
+					indexHitIds[idStr] = struct{}{}
+				} else if compiled != nil {
+					if m.matchConditionsCompiled(cached, compiled, tableCache) {
+						cachedResults = append(cachedResults, cached)
+						indexHitIds[idStr] = struct{}{}
+					}
+				} else if m.matchConditions(cached, conds, tableCache) {
 					cachedResults = append(cachedResults, cached)
 					indexHitIds[idStr] = struct{}{}
 				}
@@ -825,7 +841,16 @@ func (m *MysqlGts) FindFromCache(dest interface{}, conds ...interface{}) (found 
 		if _, skip := indexHitIds[id]; skip {
 			return true
 		}
-		if len(conds) == 0 || m.matchConditions(v, conds) {
+		if len(conds) == 0 {
+			cachedResults = append(cachedResults, v)
+		} else if compiled != nil {
+			if m.matchConditionsCompiled(v, compiled, tableCache) {
+				cachedResults = append(cachedResults, v)
+				if len(pairs) > 0 {
+					m.indexAddId(tableCache, id, pairs)
+				}
+			}
+		} else if m.matchConditions(v, conds, tableCache) {
 			cachedResults = append(cachedResults, v)
 			if len(pairs) > 0 {
 				m.indexAddId(tableCache, id, pairs)
@@ -1098,18 +1123,26 @@ func (m *MysqlGts) DeleteFromCache(model interface{}, conds ...interface{}) (str
 
 	var toDelete []string
 	var deleteItems []interface{}
+	var compiled []compiledCond
 
 	// 若有查询条件，优先使用联合二级索引命中 id，减少全表遍历
 	indexHitIds := make(map[string]struct{})
 	if len(conds) > 0 {
 		pairs := parseCondsToFieldValues(conds...)
+		compiled = m.compileConds(conds, tableCache)
 		if len(pairs) > 0 {
 			ids := m.indexLookupIds(tableCache, pairs)
 			for _, idStr := range ids {
 				rowLock := tableCache.getRowLock(idStr)
 				rowLock.RLock()
 				if cached, ok := tableCache.data.Load(idStr); ok {
-					if m.matchConditions(cached, conds) {
+					if compiled != nil {
+						if m.matchConditionsCompiled(cached, compiled, tableCache) {
+							toDelete = append(toDelete, idStr)
+							deleteItems = append(deleteItems, cached)
+							indexHitIds[idStr] = struct{}{}
+						}
+					} else if m.matchConditions(cached, conds, tableCache) {
 						toDelete = append(toDelete, idStr)
 						deleteItems = append(deleteItems, cached)
 						indexHitIds[idStr] = struct{}{}
@@ -1133,7 +1166,15 @@ func (m *MysqlGts) DeleteFromCache(model interface{}, conds ...interface{}) (str
 			return true
 		}
 		// 无条件时不会走到这里（primaryID 分支已提前返回），这里只处理带条件的兜底删除
-		if len(conds) == 0 || m.matchConditions(v, conds) {
+		if len(conds) == 0 {
+			toDelete = append(toDelete, id)
+			deleteItems = append(deleteItems, v)
+		} else if compiled != nil {
+			if m.matchConditionsCompiled(v, compiled, tableCache) {
+				toDelete = append(toDelete, id)
+				deleteItems = append(deleteItems, v)
+			}
+		} else if m.matchConditions(v, conds, tableCache) {
 			toDelete = append(toDelete, id)
 			deleteItems = append(deleteItems, v)
 		}
@@ -1206,6 +1247,29 @@ func (m *MysqlGts) Create(model interface{}) error {
 	tableCache.loaded = true
 	tableCache.mu.Unlock()
 
+	// 根据 model 当前字段值构造联合索引键值对，并写入二级索引：
+	// 仅对当前表的 indexedFields 中已有的字段建索引，避免对所有字段都建索引。
+	if tableCache != nil {
+		var fields []string
+		tableCache.indexedFields.Range(func(k, _ interface{}) bool {
+			if name, ok := k.(string); ok && name != "" {
+				fields = append(fields, name)
+			}
+			return true
+		})
+		if len(fields) > 0 {
+			pairs := make([]fieldValuePair, 0, len(fields))
+			for _, f := range fields {
+				v := m.getFieldValue(model, f, tableCache)
+				pairs = append(pairs, fieldValuePair{
+					Field: f,
+					Value: v,
+				})
+			}
+			m.indexAddId(tableCache, id, pairs)
+		}
+	}
+
 	// 记录操作日志
 	m.recordOperation(tableName, "insert", id, model)
 
@@ -1251,16 +1315,19 @@ func (m *MysqlGts) FlushAllSync() {
 		// 先“摘取一批”待处理日志并执行
 		m.syncToDatabaseV2()
 
-		// 检查是否还有未处理的操作日志
-		m.mu.RLock()
+		// 检查是否还有未处理的操作日志（遍历每表队列，不占 m.mu）
 		empty := true
-		for _, logs := range m.opLogs {
-			if len(logs) > 0 {
+		m.opLogsMap.Range(func(_, value interface{}) bool {
+			q := value.(*tableOpLogQueue)
+			q.mu.Lock()
+			has := len(q.logs) > 0
+			q.mu.Unlock()
+			if has {
 				empty = false
-				break
+				return false // 停止 Range
 			}
-		}
-		m.mu.RUnlock()
+			return true
+		})
 
 		if empty {
 			return
@@ -1293,80 +1360,37 @@ func (m *MysqlGts) syncLoop() {
 	}
 }
 
-// syncToDatabase 同步操作日志到数据库
+// syncToDatabase 同步操作日志到数据库（按表加锁摘取批次，锁外执行 DB，与 syncToDatabaseV2 一致）
 func (m *MysqlGts) syncToDatabase() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for tableName, logs := range m.opLogs {
-		if len(logs) == 0 {
-			continue
-		}
-
-		// fmt.Printf("[syncToDatabase] 表: %s, 待处理操作日志数量: %d\n", tableName, len(logs))
-
-		// 获取要处理的数量
-		processCount := m.batchSize
-		if len(logs) < processCount {
-			processCount = len(logs)
-		}
-
-		// 处理操作日志
-		toProcess := logs[:processCount]
-		remaining := logs[processCount:]
-
-		// // 打印待处理的操作日志详情
-		// for i, log := range toProcess {
-		// 	// fmt.Printf("[syncToDatabase] 表: %s, 操作日志[%d]: 操作=%s, ID=%s, 时间=%v\n",
-		// 	// 	tableName, i, log.Operation, log.ID, log.Timestamp)
-		// }
-
-		// 执行数据库操作
-		for _, log := range toProcess {
-			if err := m.executeOperation(tableName, log); err != nil {
-				// 如果操作失败，可以选择记录错误或重试
-				// fmt.Printf("[GTS 同步失败] 表: %s, 操作: %s, ID: %s, 错误: %v\n", tableName, log.Operation, log.ID, err)
-			} else {
-				// fmt.Printf("[GTS 同步成功] 表: %s, 操作: %s, ID: %s\n", tableName, log.Operation, log.ID)
-			}
-		}
-
-		// 更新操作日志列表
-		m.opLogs[tableName] = remaining
-		// fmt.Printf("[syncToDatabase] 表: %s, 剩余操作日志数量: %d\n", tableName, len(remaining))
-	}
+	m.syncToDatabaseV2()
 }
 
-// syncToDatabaseV2 同步操作日志到数据库（锁外执行 DB）
+// syncToDatabaseV2 同步操作日志到数据库（按表加锁摘取批次，锁外执行 DB，减少对 m.mu 的竞争）
 func (m *MysqlGts) syncToDatabaseV2() {
-	// 在持有全局锁的情况下，只“摘取一批”待处理日志并更新 m.opLogs，
-	// 不在锁内做任何耗时的数据库操作，避免阻塞 First/Find 等读操作。
 	batch := make(map[string][]*OperationLog)
 
-	m.mu.Lock()
-	for tableName, logs := range m.opLogs {
-		if len(logs) == 0 {
-			continue
+	// 按表遍历，每表只锁自己的 queue，摘取一批后立即释放
+	m.opLogsMap.Range(func(key, value interface{}) bool {
+		tableName := key.(string)
+		q := value.(*tableOpLogQueue)
+		q.mu.Lock()
+		if len(q.logs) == 0 {
+			q.mu.Unlock()
+			return true
 		}
-
 		processCount := m.batchSize
-		if len(logs) < processCount {
-			processCount = len(logs)
+		if len(q.logs) < processCount {
+			processCount = len(q.logs)
 		}
-		if processCount <= 0 {
-			continue
-		}
-
 		toProcess := make([]*OperationLog, processCount)
-		copy(toProcess, logs[:processCount])
+		copy(toProcess, q.logs[:processCount])
+		q.logs = q.logs[processCount:]
+		q.mu.Unlock()
+
 		batch[tableName] = toProcess
+		return true
+	})
 
-		// 剩余日志留待下次同步
-		m.opLogs[tableName] = logs[processCount:]
-	}
-	m.mu.Unlock()
-
-	// 在不持有全局锁的情况下真正执行数据库操作
 	for tableName, logs := range batch {
 		for _, log := range logs {
 			_ = m.executeOperation(tableName, log)
@@ -1461,37 +1485,39 @@ func (m *MysqlGts) executeOperation(tableName string, log *OperationLog) error {
 	return nil
 }
 
-// recordOperation 记录操作日志
+// getOrCreateOpLogQueue 获取或创建该表的操作日志队列（每表独立，仅锁本表）
+func (m *MysqlGts) getOrCreateOpLogQueue(tableName string) *tableOpLogQueue {
+	val, _ := m.opLogsMap.LoadOrStore(tableName, &tableOpLogQueue{logs: make([]*OperationLog, 0)})
+	return val.(*tableOpLogQueue)
+}
+
+// recordOperation 记录操作日志（只锁当前表队列，不占全局 m.mu，减少写竞争）
 func (m *MysqlGts) recordOperation(tableName, operation, id string, data interface{}) {
 	// 如果模型声明了 NotSyncToDatabase 且为 true，则不记录该模型的操作日志
 	if data != nil && shouldSkipOperationLog(data) {
 		return
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	q := m.getOrCreateOpLogQueue(tableName)
+	q.mu.Lock()
+	defer q.mu.Unlock()
 
 	// 检查最后一条操作日志，如果操作类型和ID都相同，则跳过
-	logs := m.opLogs[tableName]
-	if len(logs) > 0 {
-		lastLog := logs[len(logs)-1]
+	if len(q.logs) > 0 {
+		lastLog := q.logs[len(q.logs)-1]
 		if lastLog.Operation == operation && lastLog.ID == id {
-			// 相同操作，更新时间戳即可，不添加新日志
 			lastLog.Timestamp = time.Now()
 			return
 		}
 	}
 
-	// 优化：延迟转换 modelToMap，只在需要时转换（目前先不转换，减少开销）
 	log := &OperationLog{
 		Operation: operation,
 		ID:        id,
-		Data:      nil, // 延迟转换，减少反射开销
+		Data:      nil,
 		Timestamp: time.Now(),
 	}
-
-	// 记录操作日志
-	m.opLogs[tableName] = append(m.opLogs[tableName], log)
+	q.logs = append(q.logs, log)
 }
 
 // 预先缓存 NotSyncToDatabase 的反射类型，避免每次调用 reflect.TypeOf
@@ -1705,8 +1731,155 @@ func (tc *TableCache) getRowLock(id string) *sync.RWMutex {
 	return lock.(*sync.RWMutex)
 }
 
-// matchConditions 匹配查询条件
-func (m *MysqlGts) matchConditions(item interface{}, conds []interface{}) bool {
+// compiledCond 预解析后的查询子条件（当前只支持等值匹配）
+type compiledCond struct {
+	Field string      // 结构体字段名（已转换为 CamelCase）
+	Value interface{} // 比较值
+}
+
+// compileConds 将 GORM 风格的 conds 预解析为 compiledCond 列表（仅处理第一个 string 查询条件）
+// 解析失败时返回 nil，调用方可回退到原始 matchConditions 逻辑。
+func (m *MysqlGts) compileConds(conds []interface{}, tableCache *TableCache) []compiledCond {
+	if len(conds) == 0 {
+		return nil
+	}
+
+	for i := 0; i < len(conds); i++ {
+		cond := conds[i]
+
+		queryStr, ok := cond.(string)
+		if !ok {
+			continue
+		}
+		qs := strings.TrimSpace(queryStr)
+		if qs == "" || !containsSubstring(qs, "=") {
+			continue
+		}
+
+		normalized := collapseSpaces(strings.ToLower(qs))
+		segments := strings.Split(normalized, " and ")
+		raw := collapseSpaces(qs)
+
+		values := conds[i+1:]
+		valIdx := 0
+		rawRest := raw
+
+		var compiled []compiledCond
+
+		for _, seg := range segments {
+			seg = strings.TrimSpace(seg)
+			if seg == "" {
+				continue
+			}
+
+			pos := strings.Index(strings.ToLower(rawRest), seg)
+			if pos < 0 {
+				return nil
+			}
+			part := strings.TrimSpace(rawRest[pos : pos+len(seg)])
+			rawRest = rawRest[pos+len(seg):]
+
+			idxEq := strings.Index(part, "=")
+			if idxEq <= 0 || idxEq == len(part)-1 {
+				return nil
+			}
+			fieldName := strings.TrimSpace(part[:idxEq])
+			right := strings.TrimSpace(part[idxEq+1:])
+			if fieldName == "" || right == "" {
+				return nil
+			}
+
+			camelFieldName := m.toCamelCase(fieldName, tableCache)
+
+			var want interface{}
+			if len(right) > 0 && right[0] == '?' {
+				if valIdx >= len(values) {
+					return nil
+				}
+				want = values[valIdx]
+				valIdx++
+			} else {
+				lit := right
+				if strings.HasPrefix(lit, "'") && strings.HasSuffix(lit, "'") && len(lit) >= 2 {
+					lit = lit[1 : len(lit)-1]
+				}
+				want = lit
+			}
+
+			compiled = append(compiled, compiledCond{
+				Field: camelFieldName,
+				Value: want,
+			})
+		}
+
+		return compiled
+	}
+
+	return nil
+}
+
+// matchConditionsCompiled 使用预解析后的条件匹配 item，避免重复解析 queryStr
+func (m *MysqlGts) matchConditionsCompiled(item interface{}, compiled []compiledCond, tableCache *TableCache) bool {
+	if len(compiled) == 0 {
+		return true
+	}
+
+	itemValue := reflect.ValueOf(item)
+	if itemValue.Kind() == reflect.Ptr {
+		itemValue = itemValue.Elem()
+	}
+
+	for _, c := range compiled {
+		field := itemValue.FieldByName(c.Field)
+		if !field.IsValid() {
+			return false
+		}
+		fieldValue := field.Interface()
+
+		// 快路径：常见基础类型直接比较，避免 reflect.DeepEqual 和 fmt.Sprintf
+		switch fv := fieldValue.(type) {
+		case int, int8, int16, int32, int64:
+			switch vv := c.Value.(type) {
+			case int, int8, int16, int32, int64:
+				if fmt.Sprint(fv) != fmt.Sprint(vv) {
+					return false
+				}
+				continue
+			}
+		case uint, uint8, uint16, uint32, uint64:
+			switch vv := c.Value.(type) {
+			case uint, uint8, uint16, uint32, uint64:
+				if fmt.Sprint(fv) != fmt.Sprint(vv) {
+					return false
+				}
+				continue
+			}
+		case string:
+			if vs, ok := c.Value.(string); ok {
+				if fv != vs {
+					return false
+				}
+				continue
+			}
+		}
+
+		// 兜底：类型不匹配时走字符串比较，否则用 DeepEqual
+		fk := reflect.TypeOf(fieldValue).Kind()
+		vk := reflect.TypeOf(c.Value).Kind()
+		if fk != vk {
+			if fmt.Sprintf("%v", fieldValue) != fmt.Sprintf("%v", c.Value) {
+				return false
+			}
+		} else if !reflect.DeepEqual(fieldValue, c.Value) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// matchConditions 匹配查询条件；可选传入 tableCache，避免每行重复 getTableName + RLock
+func (m *MysqlGts) matchConditions(item interface{}, conds []interface{}, tableCache *TableCache) bool {
 	if len(conds) == 0 {
 		return true
 	}
@@ -1716,14 +1889,15 @@ func (m *MysqlGts) matchConditions(item interface{}, conds []interface{}) bool {
 		itemValue = itemValue.Elem()
 	}
 
-	// 获取 tableCache（需要从 item 获取表名）
-	var tableCache *TableCache
-	if tableName, err := m.getTableName(item); err == nil {
-		m.mu.RLock()
-		if tc, exists := m.tables[tableName]; exists {
-			tableCache = tc
+	// 如未显式传入 tableCache，则按旧逻辑从 item 推断表名并读取
+	if tableCache == nil {
+		if tableName, err := m.getTableName(item); err == nil {
+			m.mu.RLock()
+			if tc, exists := m.tables[tableName]; exists {
+				tableCache = tc
+			}
+			m.mu.RUnlock()
 		}
-		m.mu.RUnlock()
 	}
 
 	//fmt.Println("conds=", conds)
@@ -2122,9 +2296,15 @@ func (m *MysqlGts) GetTableStatus(tableName string) (loaded bool, recordCount in
 		recordCount++
 		return true
 	})
-
-	pendingOps = len(m.opLogs[tableName])
 	m.mu.RUnlock()
+
+	// 待同步条数从该表的 queue 读，不占 m.mu
+	if v, ok := m.opLogsMap.Load(tableName); ok {
+		q := v.(*tableOpLogQueue)
+		q.mu.Lock()
+		pendingOps = len(q.logs)
+		q.mu.Unlock()
+	}
 
 	return loaded, recordCount, pendingOps
 }
@@ -2164,6 +2344,27 @@ func (m *MysqlGts) ClearCache(tableName string) error {
 	})
 
 	return nil
+}
+
+// 打印已经索引过的字段
+func (m *MysqlGts) DebugPrintIndexedFields(tableName string) {
+	m.mu.RLock()
+	tableCache, exists := m.tables[tableName]
+	if !exists {
+		fmt.Printf("[GTS][IndexedFields] table %s not found\n", tableName)
+		m.mu.RUnlock()
+		return
+	}
+	tableCache.indexedFields.Range(func(k, _ interface{}) bool {
+		fieldName, ok := k.(string)
+		if !ok {
+			return true
+		}
+		fmt.Printf("  field=%s\n", fieldName)
+		return true
+	})
+	m.mu.RUnlock()
+	fmt.Printf("[GTS][IndexedFields] table=%s\n", tableName)
 }
 
 // DebugPrintTableIndex 打印指定表的二级索引（仅用于调试）
