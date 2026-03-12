@@ -1024,12 +1024,28 @@ func (m *MysqlGts) Update(model interface{}, values map[string]interface{}) erro
 
 	return nil
 }
+func (m *MysqlGts) Delete(model interface{}, conds ...interface{}) error {
+	tableName, toDeleteIds, deleteItems, err := m.DeleteFromCache(model, conds...)
+	if err != nil {
+		return err
+	}
+	// 记录操作日志
+	for i, id := range toDeleteIds {
+		m.recordOperation(tableName, "delete", id, deleteItems[i])
+	}
+
+	return nil
+}
+func (m *MysqlGts) UnLoadFromCache(model interface{}, conds ...interface{}) error {
+	_, _, _, err := m.DeleteFromCache(model, conds...)
+	return err
+}
 
 // Delete 删除记录
-func (m *MysqlGts) Delete(model interface{}, conds ...interface{}) error {
+func (m *MysqlGts) DeleteFromCache(model interface{}, conds ...interface{}) (string, []string, []interface{}, error) {
 	tableName, err := m.getTableName(model)
 	if err != nil {
-		return fmt.Errorf("获取表名失败: %v", err)
+		return "", nil, nil, fmt.Errorf("获取表名失败: %v", err)
 	}
 
 	m.mu.RLock()
@@ -1037,7 +1053,18 @@ func (m *MysqlGts) Delete(model interface{}, conds ...interface{}) error {
 	m.mu.RUnlock()
 
 	if !exists {
-		return fmt.Errorf("表 %s 未初始化，请先调用 InitTable", tableName)
+		return "", nil, nil, fmt.Errorf("表 %s 未初始化，请先调用 InitTable", tableName)
+	}
+
+	// 未传入条件时，必须依赖 model 的主键 ID 精确删除单条记录；
+	// 若无法获取主键 ID，则直接报错，避免误删整表或产生歧义。
+	var primaryID string
+	if len(conds) == 0 {
+		id := m.getIDValue(model, tableCache.primaryKey, tableCache)
+		if id == "" || id == "0" {
+			return "", nil, nil, fmt.Errorf("DeleteFromCache 未传入条件且无法从 model 获取主键 ID（字段名: %s），请确认模型包含有效的 ID 字段", tableCache.primaryKey)
+		}
+		primaryID = id
 	}
 
 	// 如果缓存未加载，先加载
@@ -1046,20 +1073,66 @@ func (m *MysqlGts) Delete(model interface{}, conds ...interface{}) error {
 	tableCache.mu.RUnlock()
 
 	if !loaded {
-		// 传入 conds 则按条件加载；否则 Load 内部会按 model 的主键 ID 查询
-		if err := m.Load(model, conds...); err != nil {
-			return err
+		return "", nil, nil, errors.New("缓存未加载")
+	}
+
+	// 特殊分支：未传入条件且拿到了主键 ID，直接按主键精确删除，避免全表遍历和 matchConditions
+	if primaryID != "" {
+		// 获取该行的行级锁
+		rowLock := tableCache.getRowLock(primaryID)
+		rowLock.Lock()
+		defer rowLock.Unlock()
+
+		// 从缓存中加载要删除的记录
+		v, ok := tableCache.data.Load(primaryID)
+		if !ok {
+			return "", nil, nil, gorm.ErrRecordNotFound
 		}
+
+		// 删除缓存与索引
+		tableCache.data.Delete(primaryID)
+		tableCache.rowLocks.Delete(primaryID)
+		m.indexRemoveId(tableCache, primaryID)
+		return tableName, []string{primaryID}, []interface{}{v}, nil
 	}
 
 	var toDelete []string
 	var deleteItems []interface{}
-	// 遍历 sync.Map，找出要删除的记录
+
+	// 若有查询条件，优先使用联合二级索引命中 id，减少全表遍历
+	indexHitIds := make(map[string]struct{})
+	if len(conds) > 0 {
+		pairs := parseCondsToFieldValues(conds...)
+		if len(pairs) > 0 {
+			ids := m.indexLookupIds(tableCache, pairs)
+			for _, idStr := range ids {
+				rowLock := tableCache.getRowLock(idStr)
+				rowLock.RLock()
+				if cached, ok := tableCache.data.Load(idStr); ok {
+					if m.matchConditions(cached, conds) {
+						toDelete = append(toDelete, idStr)
+						deleteItems = append(deleteItems, cached)
+						indexHitIds[idStr] = struct{}{}
+					}
+				}
+				rowLock.RUnlock()
+			}
+		}
+	}
+
+	fmt.Println("indexHitIds", indexHitIds)
+
+	// 遍历 sync.Map，找出剩余需要删除的记录（跳过已通过索引命中的 id）
 	tableCache.data.Range(func(k, v interface{}) bool {
 		id, ok := k.(string)
 		if !ok {
 			return true
 		}
+		// 已通过索引命中的，跳过
+		if _, skip := indexHitIds[id]; skip {
+			return true
+		}
+		// 无条件时不会走到这里（primaryID 分支已提前返回），这里只处理带条件的兜底删除
 		if len(conds) == 0 || m.matchConditions(v, conds) {
 			toDelete = append(toDelete, id)
 			deleteItems = append(deleteItems, v)
@@ -1068,7 +1141,7 @@ func (m *MysqlGts) Delete(model interface{}, conds ...interface{}) error {
 	})
 
 	if len(toDelete) == 0 {
-		return gorm.ErrRecordNotFound
+		return "", nil, nil, gorm.ErrRecordNotFound
 	}
 
 	// 获取所有要删除记录的行级锁（按顺序获取，避免死锁）
@@ -1092,12 +1165,7 @@ func (m *MysqlGts) Delete(model interface{}, conds ...interface{}) error {
 		m.indexRemoveId(tableCache, id)
 	}
 
-	// 记录操作日志
-	for i, id := range toDelete {
-		m.recordOperation(tableName, "delete", id, deleteItems[i])
-	}
-
-	return nil
+	return tableName, toDelete, deleteItems, nil
 }
 
 // Create 创建新记录
