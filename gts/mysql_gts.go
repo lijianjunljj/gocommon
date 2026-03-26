@@ -11,6 +11,7 @@ import (
 	configLogic "myserver/src/config/tables"
 
 	"github.com/lijianjunljj/gocommon/curd"
+	"github.com/lijianjunljj/jungo/jun_log"
 	"gorm.io/gorm"
 )
 
@@ -811,9 +812,11 @@ func (m *MysqlGts) FindFromCache(dest interface{}, conds ...interface{}) (found 
 	pairs := parseCondsToFieldValues(conds...)
 	compiled := m.compileConds(conds, tableCache)
 	indexHitIds := make(map[string]struct{})
+	fmt.Println("pairs:", pairs)
 	var cachedResults []interface{}
 	if len(pairs) > 0 {
 		ids := m.indexLookupIds(tableCache, pairs)
+		fmt.Println("ids:", ids)
 		for _, idStr := range ids {
 			rowLock := tableCache.getRowLock(idStr)
 			rowLock.RLock()
@@ -834,6 +837,9 @@ func (m *MysqlGts) FindFromCache(dest interface{}, conds ...interface{}) (found 
 			rowLock.RUnlock()
 		}
 	}
+
+	fmt.Println("cachedResults:", cachedResults)
+	fmt.Println("indexHitIds:", indexHitIds)
 
 	// 遍历 sync.Map 匹配条件（跳过已从联合索引命中的 id，避免重复）
 	tableCache.data.Range(func(_, v interface{}) bool {
@@ -1393,7 +1399,10 @@ func (m *MysqlGts) syncToDatabaseV2() {
 
 	for tableName, logs := range batch {
 		for _, log := range logs {
-			_ = m.executeOperation(tableName, log)
+			err := m.executeOperation(tableName, log)
+			if err != nil {
+				jun_log.Error("执行操作日志到数据库失败", "tableName", tableName, "log", log, "error", err)
+			}
 		}
 	}
 }
