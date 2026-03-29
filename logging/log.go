@@ -25,7 +25,6 @@ func (f *FileMgr) AddFile(file *os.File) {
 }
 
 func (f *FileMgr) Collect() {
-	Debug("start connect....", len(f.files))
 	f.lock.Lock()
 	defer f.lock.Unlock()
 	for k, _ := range f.files {
@@ -34,7 +33,6 @@ func (f *FileMgr) Collect() {
 			delete(f.files, k)
 		}
 	}
-	Debug("end connect....", len(f.files))
 }
 
 type Level int

@@ -1,9 +1,13 @@
 package gts
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
+	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -104,10 +108,32 @@ type TableCache struct {
 
 // OperationLog 操作日志
 type OperationLog struct {
+	// persistMu 单条日志入库互斥：同一指针仅允许一个协程写库；TryLock 失败则本次跳过并打日志。
+	persistMu sync.Mutex
 	Operation string                 // 操作类型：insert, update, delete
 	Data      map[string]interface{} // 操作数据
 	ID        string                 // 主键 ID
 	Timestamp time.Time              // 操作时间
+}
+
+// PendingOpLogSnapshot 待同步队列条目快照（无互斥体，可安全按值传递与 JSON 序列化）
+type PendingOpLogSnapshot struct {
+	Operation string
+	Data      map[string]interface{}
+	ID        string
+	Timestamp time.Time
+}
+
+// operationLogString 将操作日志格式化为可读字符串（用于日志，避免只打印指针地址）。
+func operationLogString(log *OperationLog) string {
+	if log == nil {
+		return "<nil OperationLog>"
+	}
+	if b, err := json.Marshal(log); err == nil {
+		return string(b)
+	}
+	return fmt.Sprintf("Operation{op:%q id:%q time:%s data:%+v}",
+		log.Operation, log.ID, log.Timestamp.Format(time.RFC3339Nano), log.Data)
 }
 
 // tableOpLogQueue 单表操作日志队列，仅本表加锁，减少与其它表的竞争
@@ -122,7 +148,7 @@ func NewMysqlGts(db *gorm.DB) *MysqlGts {
 		db:           db,
 		tables:       make(map[string]*TableCache),
 		syncInterval: 1 * time.Second, // 默认 1 秒同步一次
-		batchSize:    100,             // 默认每次处理 100 条
+		batchSize:    1000,            // 默认每次处理 100 条
 		stopChan:     make(chan struct{}),
 		syncRunning:  false,
 	}
@@ -812,11 +838,11 @@ func (m *MysqlGts) FindFromCache(dest interface{}, conds ...interface{}) (found 
 	pairs := parseCondsToFieldValues(conds...)
 	compiled := m.compileConds(conds, tableCache)
 	indexHitIds := make(map[string]struct{})
-	fmt.Println("pairs:", pairs)
+	// fmt.Println("pairs:", pairs)
 	var cachedResults []interface{}
 	if len(pairs) > 0 {
 		ids := m.indexLookupIds(tableCache, pairs)
-		fmt.Println("ids:", ids)
+		// fmt.Println("ids:", ids)
 		for _, idStr := range ids {
 			rowLock := tableCache.getRowLock(idStr)
 			rowLock.RLock()
@@ -838,8 +864,8 @@ func (m *MysqlGts) FindFromCache(dest interface{}, conds ...interface{}) (found 
 		}
 	}
 
-	fmt.Println("cachedResults:", cachedResults)
-	fmt.Println("indexHitIds:", indexHitIds)
+	// fmt.Println("cachedResults:", cachedResults)
+	// fmt.Println("indexHitIds:", indexHitIds)
 
 	// 遍历 sync.Map 匹配条件（跳过已从联合索引命中的 id，避免重复）
 	tableCache.data.Range(func(_, v interface{}) bool {
@@ -1044,17 +1070,16 @@ func (m *MysqlGts) Update(model interface{}, values map[string]interface{}) erro
 
 	// 使用行级锁 + sync.Map 更新 data
 	tableCache.data.Store(id, item)
-
+	// 记录操作日志
+	m.recordOperation(tableName, "update", id, item)
 	// 重建二级索引：先取出该 id 曾参与的字段名，移除旧索引，再按当前 model 回填
 	fields := m.indexFieldsForId(tableCache, id)
 	m.indexRemoveId(tableCache, id)
 	m.indexRebuildForId(tableCache, id, item, fields)
 
-	// 记录操作日志
-	m.recordOperation(tableName, "update", id, item)
-
 	return nil
 }
+
 func (m *MysqlGts) Delete(model interface{}, conds ...interface{}) error {
 	tableName, toDeleteIds, deleteItems, err := m.DeleteFromCache(model, conds...)
 	if err != nil {
@@ -1067,6 +1092,7 @@ func (m *MysqlGts) Delete(model interface{}, conds ...interface{}) error {
 
 	return nil
 }
+
 func (m *MysqlGts) UnLoadFromCache(model interface{}, conds ...interface{}) error {
 	_, _, _, err := m.DeleteFromCache(model, conds...)
 	return err
@@ -1159,7 +1185,7 @@ func (m *MysqlGts) DeleteFromCache(model interface{}, conds ...interface{}) (str
 		}
 	}
 
-	fmt.Println("indexHitIds", indexHitIds)
+	// fmt.Println("indexHitIds", indexHitIds)
 
 	// 遍历 sync.Map，找出剩余需要删除的记录（跳过已通过索引命中的 id）
 	tableCache.data.Range(func(k, v interface{}) bool {
@@ -1318,28 +1344,41 @@ func (m *MysqlGts) FlushAllSync() {
 	m.StopSync()
 
 	for {
-		// 先“摘取一批”待处理日志并执行
-		m.syncToDatabaseV2()
+		done := false
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					jun_log.Error("GTS FlushAllSync 单次迭代 panic，将 sleep 后重试", "recover", r)
+				}
+			}()
 
-		// 检查是否还有未处理的操作日志（遍历每表队列，不占 m.mu）
-		empty := true
-		m.opLogsMap.Range(func(_, value interface{}) bool {
-			q := value.(*tableOpLogQueue)
-			q.mu.Lock()
-			has := len(q.logs) > 0
-			q.mu.Unlock()
-			if has {
-				empty = false
-				return false // 停止 Range
+			m.syncToDatabaseV2()
+
+			empty := true
+			m.opLogsMap.Range(func(_, value interface{}) bool {
+				q, ok := value.(*tableOpLogQueue)
+				if !ok {
+					return true
+				}
+				q.mu.Lock()
+				has := len(q.logs) > 0
+				q.mu.Unlock()
+				if has {
+					empty = false
+					return false
+				}
+				return true
+			})
+
+			if empty {
+				done = true
 			}
-			return true
-		})
+		}()
 
-		if empty {
+		if done {
 			return
 		}
 
-		// 若仍有剩余日志，稍作等待再继续，避免紧急自旋
 		time.Sleep(10 * time.Millisecond)
 	}
 }
@@ -1351,7 +1390,7 @@ func FlushAll() {
 	}
 }
 
-// syncLoop 同步循环
+// syncLoop 同步循环（不因单次同步 panic/失败而退出，仅 StopSync 关闭 stopChan 时结束）。
 func (m *MysqlGts) syncLoop() {
 	ticker := time.NewTicker(m.syncInterval)
 	defer ticker.Stop()
@@ -1359,19 +1398,22 @@ func (m *MysqlGts) syncLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			m.syncToDatabaseV2()
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						jun_log.Error("GTS syncLoop syncToDatabaseV2 panic，已恢复继续循环", "recover", r)
+					}
+				}()
+				m.syncToDatabaseV2()
+			}()
 		case <-m.stopChan:
 			return
 		}
 	}
 }
 
-// syncToDatabase 同步操作日志到数据库（按表加锁摘取批次，锁外执行 DB，与 syncToDatabaseV2 一致）
-func (m *MysqlGts) syncToDatabase() {
-	m.syncToDatabaseV2()
-}
-
-// syncToDatabaseV2 同步操作日志到数据库（按表加锁摘取批次，锁外执行 DB，减少对 m.mu 的竞争）
+// syncToDatabaseV2 同步操作日志到数据库（按表加锁摘取批次，锁外执行 DB，减少对 m.mu 的竞争）。
+// 摘批后按表起独立协程并行入库，不同表互不阻塞；单表内仍按队列顺序逐条 executeOperation。
 func (m *MysqlGts) syncToDatabaseV2() {
 	batch := make(map[string][]*OperationLog)
 
@@ -1397,18 +1439,45 @@ func (m *MysqlGts) syncToDatabaseV2() {
 		return true
 	})
 
-	for tableName, logs := range batch {
-		for _, log := range logs {
-			err := m.executeOperation(tableName, log)
-			if err != nil {
-				jun_log.Error("执行操作日志到数据库失败", "tableName", tableName, "log", log, "error", err)
-			}
-		}
+	if len(batch) == 0 {
+		return
 	}
+
+	var wg sync.WaitGroup
+	for tn, logs := range batch {
+		wg.Add(1)
+		go func(tableName string, tableLogs []*OperationLog) {
+			jun_log.Debug("GTS syncToDatabaseV2 按表入库协程开始", "tableName", tableName, "tableLogs", len(tableLogs))
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					jun_log.Error("GTS syncToDatabaseV2 按表入库协程 panic", "tableName", tableName, "recover", r)
+				}
+			}()
+			for _, log := range tableLogs {
+				err := m.executeOperation(tableName, log)
+				if err != nil {
+					jun_log.Error("执行操作日志到数据库失败", "tableName", tableName, "operationLog", operationLogString(log), "error", err)
+				}
+			}
+			jun_log.Debug("GTS syncToDatabaseV2 按表入库协程结束", "tableName", tableName, "tableLogs", len(tableLogs))
+		}(tn, logs)
+	}
+	wg.Wait()
 }
 
 // executeOperation 执行单个操作
 func (m *MysqlGts) executeOperation(tableName string, log *OperationLog) error {
+	if log == nil {
+		return nil
+	}
+	if !log.persistMu.TryLock() {
+		jun_log.Error("GTS executeOperation 同条 OperationLog 正被其他协程入库，跳过本次",
+			"tableName", tableName, "operationLog", operationLogString(log))
+		return nil
+	}
+	defer log.persistMu.Unlock()
+
 	tableCache, exists := m.tables[tableName]
 	if !exists {
 		return fmt.Errorf("表 %s 不存在", tableName)
@@ -1423,7 +1492,8 @@ func (m *MysqlGts) executeOperation(tableName string, log *OperationLog) error {
 		rowLock.RUnlock()
 
 		if !exists {
-			// 如果缓存中没有，说明可能已经被删除，跳过
+			jun_log.Release("GTS executeOperation insert 缓存中无该行，跳过同步（可能已被删除）",
+				"tableName", tableName, "operationLog", operationLogString(log))
 			return nil
 		}
 
@@ -1441,7 +1511,8 @@ func (m *MysqlGts) executeOperation(tableName string, log *OperationLog) error {
 		rowLock.RUnlock()
 
 		if !exists {
-			// 如果缓存中没有，说明可能已经被删除，跳过
+			jun_log.Release("GTS executeOperation update 缓存中无该行，跳过同步（可能已被删除）",
+				"tableName", tableName, "operationLog", operationLogString(log))
 			return nil
 		}
 
@@ -1511,12 +1582,41 @@ func (m *MysqlGts) recordOperation(tableName, operation, id string, data interfa
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	// 检查最后一条操作日志，如果操作类型和ID都相同，则跳过
+	// 调试：insert 时若队列中已存在同 id 的 insert（且非仅队尾可合并），打 Error + 调用栈，便于定位重复入队来源
+	if operation == "insert" && len(q.logs) > 0 {
+		var insertSameIDIdx []int
+		for i, ex := range q.logs {
+			if ex != nil && ex.Operation == "insert" && ex.ID == id {
+				insertSameIDIdx = append(insertSameIDIdx, i)
+			}
+		}
+		last := q.logs[len(q.logs)-1]
+		mergeTail := last.Operation == operation && last.ID == id
+		if len(insertSameIDIdx) >= 2 {
+			jun_log.Error("GTS recordOperation 调试: 队列中已有多条同表同 id 的 insert",
+				"tableName", tableName, "id", id, "indices", insertSameIDIdx,
+				"stack", string(debug.Stack()))
+		} else if len(insertSameIDIdx) == 1 && !mergeTail {
+			jun_log.Error("GTS recordOperation 调试: 队列中非队尾已有一条 insert，本次又将 append 同 id insert",
+				"tableName", tableName, "id", id, "existingIndex", insertSameIDIdx[0],
+				"stack", string(debug.Stack()))
+		}
+	}
+
+	// 若队列中已有与本次相同 operation+id 的日志，全部删除后再 append 新记录（新时间戳、新指针）。
+	// 入库时 executeOperation 对 update 等从缓存读全量，同 op+id 只保留最后一条即可。
+	removed := false
 	if len(q.logs) > 0 {
-		lastLog := q.logs[len(q.logs)-1]
-		if lastLog.Operation == operation && lastLog.ID == id {
-			lastLog.Timestamp = time.Now()
-			return
+		out := make([]*OperationLog, 0, len(q.logs))
+		for _, l := range q.logs {
+			if l != nil && l.Operation == operation && l.ID == id {
+				removed = true
+				continue
+			}
+			out = append(out, l)
+		}
+		if removed {
+			q.logs = out
 		}
 	}
 
@@ -2440,4 +2540,156 @@ func (m *MysqlGts) DebugPrintTableData(tableName string) {
 		fmt.Printf("  id=%s data=%v\n", idStr, dataMap)
 		return true
 	})
+}
+
+// AdminCacheRow GM：缓存行快照（按主键 id 排序后分页）
+type AdminCacheRow struct {
+	ID   string                 `json:"id"`
+	Data map[string]interface{} `json:"data"`
+}
+
+// AdminListCacheRows 分页列出某表 GTS 内存缓存中的记录（转为 map 便于 JSON）。
+func (m *MysqlGts) AdminListCacheRows(tableName string, page, pageSize int) ([]AdminCacheRow, int, error) {
+	if m == nil {
+		return nil, 0, errors.New("Gts 未初始化")
+	}
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 500 {
+		pageSize = 500
+	}
+	m.mu.RLock()
+	tableCache, exists := m.tables[tableName]
+	m.mu.RUnlock()
+	if !exists {
+		return nil, 0, fmt.Errorf("表 %s 未在 GTS 中注册", tableName)
+	}
+	type pair struct {
+		id string
+		m  map[string]interface{}
+	}
+	var pairs []pair
+	tableCache.data.Range(func(idKey, val interface{}) bool {
+		idStr, ok := idKey.(string)
+		if !ok {
+			return true
+		}
+		pairs = append(pairs, pair{id: idStr, m: m.modelToMap(val)})
+		return true
+	})
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].id < pairs[j].id })
+	total := len(pairs)
+	start := (page - 1) * pageSize
+	if start > total {
+		return []AdminCacheRow{}, total, nil
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+	out := make([]AdminCacheRow, 0, end-start)
+	for _, p := range pairs[start:end] {
+		out = append(out, AdminCacheRow{ID: p.id, Data: p.m})
+	}
+	return out, total, nil
+}
+
+func adminExtractUserInfoID(v interface{}) (int32, bool) {
+	rv := reflect.ValueOf(v)
+	if rv.Kind() == reflect.Ptr {
+		if rv.IsNil() {
+			return 0, false
+		}
+		rv = rv.Elem()
+	}
+	if !rv.IsValid() || rv.Kind() != reflect.Struct {
+		return 0, false
+	}
+	f := rv.FieldByName("UserInfoID")
+	if !f.IsValid() || !f.CanInterface() {
+		return 0, false
+	}
+	switch x := f.Interface().(type) {
+	case int32:
+		return x, true
+	case int:
+		return int32(x), true
+	case int64:
+		return int32(x), true
+	case uint32:
+		return int32(x), true
+	default:
+		return 0, false
+	}
+}
+
+// AdminFlushCacheRowsByUserInfoID 将某表中 UserInfoID 匹配的缓存行用 GORM Save 直接写入数据库（GM 用）。
+func (m *MysqlGts) AdminFlushCacheRowsByUserInfoID(tableName string, userInfoID int32) (saved int, err error) {
+	if m == nil {
+		return 0, errors.New("Gts 未初始化")
+	}
+	m.mu.RLock()
+	tableCache, exists := m.tables[tableName]
+	m.mu.RUnlock()
+	if !exists {
+		return 0, fmt.Errorf("表 %s 未在 GTS 中注册", tableName)
+	}
+	tableCache.data.Range(func(idKey, val interface{}) bool {
+		uid, ok := adminExtractUserInfoID(val)
+		if !ok || uid != userInfoID {
+			return true
+		}
+		idStr, _ := idKey.(string)
+		rowLock := tableCache.getRowLock(idStr)
+		rowLock.RLock()
+		v, ok := tableCache.data.Load(idStr)
+		rowLock.RUnlock()
+		if !ok || v == nil {
+			return true
+		}
+		if u2, ok2 := adminExtractUserInfoID(v); !ok2 || u2 != userInfoID {
+			return true
+		}
+		if err := m.db.Session(&gorm.Session{FullSaveAssociations: false}).Save(v).Error; err != nil {
+			jun_log.Error("AdminFlushCacheRowsByUserInfoID Save 失败", "tableName", tableName, "id", idStr, "error", err)
+			return true
+		}
+		saved++
+		return true
+	})
+	return saved, nil
+}
+
+// AdminListPendingOpLogs 返回某表操作日志队列快照（尚未被 syncLoop 消费的部分，深拷贝 Data）。
+func (m *MysqlGts) AdminListPendingOpLogs(tableName string) ([]PendingOpLogSnapshot, error) {
+	if m == nil {
+		return nil, errors.New("Gts 未初始化")
+	}
+	val, ok := m.opLogsMap.Load(tableName)
+	if !ok {
+		return []PendingOpLogSnapshot{}, nil
+	}
+	q := val.(*tableOpLogQueue)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	out := make([]PendingOpLogSnapshot, 0, len(q.logs))
+	for _, l := range q.logs {
+		if l == nil {
+			continue
+		}
+		cp := PendingOpLogSnapshot{
+			Operation: l.Operation,
+			ID:        l.ID,
+			Timestamp: l.Timestamp,
+		}
+		if l.Data != nil {
+			cp.Data = maps.Clone(l.Data)
+		}
+		out = append(out, cp)
+	}
+	return out, nil
 }
