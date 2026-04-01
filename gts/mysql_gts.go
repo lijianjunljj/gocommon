@@ -104,6 +104,10 @@ type TableCache struct {
 	index         sync.Map
 	indexReverse  sync.Map // key=id(string), value=*sync.Map(key="field|value", value=struct{})，用于 Update/Delete 时清理与重建
 	indexedFields sync.Map // key=fieldName(string), value=struct{}，记录参与过索引的字段，用于重建
+	// indexFullyBuiltFields 记录哪些字段已对【当前缓存内全部行】构建过索引。
+	// 一旦字段进入该集合，后续 Create/Update/FindFromDB/FirstFromDB 写入缓存时会同步维护该字段索引，
+	// FindFromCache 也就可以稳定地跳过全表 Range 扫描（只在索引命中集合内匹配）。
+	indexFullyBuiltFields sync.Map // key=fieldName(string), value=struct{}
 }
 
 // OperationLog 操作日志
@@ -152,20 +156,6 @@ func NewMysqlGts(db *gorm.DB) *MysqlGts {
 		stopChan:     make(chan struct{}),
 		syncRunning:  false,
 	}
-}
-
-// buildIndexKey 根据 First/Find 的查询条件构建一个稳定的字符串 key，用于二级索引。
-// 逻辑简单粗暴：依次将 conds 序列化为字符串并用 "|" 连接。
-// 注意：仅用于缓存命中加速，不参与业务逻辑判断。
-func buildIndexKey(conds ...interface{}) string {
-	if len(conds) == 0 {
-		return ""
-	}
-	parts := make([]string, 0, len(conds))
-	for _, c := range conds {
-		parts = append(parts, fmt.Sprint(c))
-	}
-	return strings.Join(parts, "|")
 }
 
 // fieldValuePair 联合索引的 (表字段, 字段值) 对
@@ -251,46 +241,6 @@ func parseCondsToFieldValues(conds ...interface{}) []fieldValuePair {
 
 	return pairs
 }
-
-/*
-	旧实现：仅支持 "field = ?" 且一个 conds 对应一个字段，不支持 "level = 0" 这类常量写法。
-	保留注释供参考。
-
-	// 提取所有字段名，例如 "anchor_info_id = ? and level = ?" -> ["anchor_info_id","level"]
-	fields := extractAllFieldNames(queryStr)
-	if len(fields) == 0 {
-		return pairs
-	}
-
-	// 统计 ? 的个数，决定最多能消费多少个值
-	placeholderCount := 0
-	for _, ch := range queryStr {
-		if ch == '?' {
-			placeholderCount++
-		}
-	}
-	// 实际可用的值数量 = min(placeholderCount, len(conds)-1)
-	maxVals := placeholderCount
-	if maxVals > len(conds)-1 {
-		maxVals = len(conds) - 1
-	}
-	if maxVals <= 0 {
-		return pairs
-	}
-
-	// 将前 maxVals 个字段名与 conds[1:maxVals+1] 依次配对
-	for i := 0; i < maxVals && i < len(fields); i++ {
-		field := strings.TrimSpace(fields[i])
-		if field == "" {
-			continue
-		}
-		value := fmt.Sprint(conds[1+i])
-		pairs = append(pairs, fieldValuePair{Field: field, Value: value})
-	}
-
-	return pairs
-}
-*/
 
 // indexAddId 将 id 加入联合索引的 (field, value) 集合，并记录到 indexReverse 与 indexedFields
 func (m *MysqlGts) indexAddId(tableCache *TableCache, id string, pairs []fieldValuePair) {
@@ -777,7 +727,8 @@ func (m *MysqlGts) FirstFromDB(model interface{}, conds ...interface{}) error {
 		cachedItem := reflect.New(modelType).Interface()
 		if err := m.copyModel(model, cachedItem); err == nil {
 			tableCache.data.Store(id, cachedItem)
-			m.indexAddId(tableCache, id, pairs)
+			allPairs := mergePairs(pairs, m.fullyBuiltPairsForModel(tableCache, cachedItem))
+			m.indexAddId(tableCache, id, allPairs)
 		}
 	}
 
@@ -841,6 +792,26 @@ func (m *MysqlGts) FindFromCache(dest interface{}, conds ...interface{}) (found 
 	// fmt.Println("pairs:", pairs)
 	var cachedResults []interface{}
 	if len(pairs) > 0 {
+		// 若本次查询字段已对当前缓存内所有行完整建索引，则可以跳过后续全表 Range 扫描。
+		// 注意：字段首次 full-build 会扫一遍表，但之后会被持续维护，避免反复扫表。
+		seenField := make(map[string]struct{}, len(pairs))
+		for _, p := range pairs {
+			if p.Field == "" {
+				continue
+			}
+			if _, ok := seenField[p.Field]; ok {
+				continue
+			}
+			seenField[p.Field] = struct{}{}
+			if _, ok := tableCache.indexFullyBuiltFields.Load(p.Field); ok {
+				continue
+			}
+			// 该字段尚未 fully-built：对当前缓存内所有行补建一次索引（一次性成本）。
+			// 补建完成后标记为 fully-built，后续写入会持续维护该字段索引。
+			m.buildIndexForField(tableCache, p.Field)
+			tableCache.indexFullyBuiltFields.Store(p.Field, struct{}{})
+		}
+
 		ids := m.indexLookupIds(tableCache, pairs)
 		// fmt.Println("ids:", ids)
 		for _, idStr := range ids {
@@ -862,6 +833,25 @@ func (m *MysqlGts) FindFromCache(dest interface{}, conds ...interface{}) (found 
 			}
 			rowLock.RUnlock()
 		}
+
+		// 已全量建索引的字段会被持续维护，因此这里可以直接返回（不再全表 Range）。
+		destValue := reflect.ValueOf(dest).Elem()
+		for _, item := range cachedResults {
+			newItem := reflect.New(modelType).Interface()
+			if err := m.copyModel(item, newItem); err != nil {
+				continue
+			}
+			elemValue := reflect.ValueOf(newItem)
+			if destValue.Type().Elem().Kind() != elemValue.Kind() && elemValue.Kind() == reflect.Ptr &&
+				destValue.Type().Elem() == elemValue.Type().Elem() {
+				elemValue = elemValue.Elem()
+			}
+			destValue.Set(reflect.Append(destValue, elemValue))
+		}
+		if len(cachedResults) > 0 {
+			return true, nil
+		}
+		return false, nil
 	}
 
 	// fmt.Println("cachedResults:", cachedResults)
@@ -918,6 +908,72 @@ func (m *MysqlGts) FindFromCache(dest interface{}, conds ...interface{}) (found 
 	return false, nil
 }
 
+// buildIndexForField 对当前 tableCache.data 中的所有行，为指定字段构建二级索引。
+// 这是一次性成本，用于将后续相同字段的 FindFromCache 从全表扫描变为索引命中。
+func (m *MysqlGts) buildIndexForField(tableCache *TableCache, fieldName string) {
+	if tableCache == nil || fieldName == "" {
+		return
+	}
+	tableCache.data.Range(func(_, v interface{}) bool {
+		id := m.getIDValue(v, tableCache.primaryKey, tableCache)
+		if id == "" || id == "0" {
+			return true
+		}
+		value := m.getFieldValue(v, fieldName, tableCache)
+		// 为该行的 (field,value) 建索引
+		m.indexAddId(tableCache, id, []fieldValuePair{{Field: fieldName, Value: value}})
+		return true
+	})
+}
+
+// fullyBuiltPairsForModel 根据 tableCache.indexFullyBuiltFields 生成该模型的索引键值对。
+// 用于在写入缓存时持续维护“已全量建过索引”的字段，避免后续查询反复全表扫描补建。
+func (m *MysqlGts) fullyBuiltPairsForModel(tableCache *TableCache, model interface{}) []fieldValuePair {
+	if tableCache == nil || model == nil {
+		return nil
+	}
+	var pairs []fieldValuePair
+	tableCache.indexFullyBuiltFields.Range(func(k, _ interface{}) bool {
+		field, ok := k.(string)
+		if !ok || field == "" {
+			return true
+		}
+		val := m.getFieldValue(model, field, tableCache)
+		pairs = append(pairs, fieldValuePair{Field: field, Value: val})
+		return true
+	})
+	return pairs
+}
+
+func mergePairs(a, b []fieldValuePair) []fieldValuePair {
+	if len(b) == 0 {
+		return a
+	}
+	if len(a) == 0 {
+		return b
+	}
+	// 去重：同字段同值只保留一份
+	seen := make(map[string]struct{}, len(a)+len(b))
+	out := make([]fieldValuePair, 0, len(a)+len(b))
+	for _, p := range a {
+		key := p.Field + "\x00" + p.Value
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, p)
+	}
+	for _, p := range b {
+		key := p.Field + "\x00" + p.Value
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, p)
+	}
+	return out
+}
+
 // FindFromDB 仅从数据库查询多条记录，并回填到缓存中
 func (m *MysqlGts) FindFromDB(dest interface{}, conds ...interface{}) error {
 	tableName, err := m.getTableNameFromDest(dest)
@@ -965,7 +1021,8 @@ func (m *MysqlGts) FindFromDB(dest interface{}, conds ...interface{}) error {
 			if err := m.copyModel(item, cachedItem); err == nil {
 				tableCache.data.Store(id, cachedItem)
 			}
-			m.indexAddId(tableCache, id, pairs)
+			allPairs := mergePairs(pairs, m.fullyBuiltPairsForModel(tableCache, cachedItem))
+			m.indexAddId(tableCache, id, allPairs)
 
 			rowLock.Unlock()
 		}
@@ -1135,17 +1192,30 @@ func (m *MysqlGts) DeleteFromCache(model interface{}, conds ...interface{}) (str
 
 	// 特殊分支：未传入条件且拿到了主键 ID，直接按主键精确删除，避免全表遍历和 matchConditions
 	if primaryID != "" {
-		// 获取该行的行级锁
+		// 先读出当前缓存对象（不要持有写锁去 flush，否则 executeOperation 会尝试 RLock 同一行导致死锁）
 		rowLock := tableCache.getRowLock(primaryID)
-		rowLock.Lock()
-		defer rowLock.Unlock()
-
-		// 从缓存中加载要删除的记录
+		rowLock.RLock()
 		v, ok := tableCache.data.Load(primaryID)
+		rowLock.RUnlock()
 		if !ok {
 			return "", nil, nil, gorm.ErrRecordNotFound
 		}
 
+		// 删除前：刷该条相关操作日志，并 Save 一次兜底
+		if err := m.flushOperationLogsForIDs(tableName, []string{primaryID}); err != nil {
+			return "", nil, nil, err
+		}
+		if err := m.db.Save(v).Error; err != nil {
+			return "", nil, nil, err
+		}
+
+		// 再获取该行的行级写锁并删除
+		rowLock.Lock()
+		defer rowLock.Unlock()
+		if _, ok := tableCache.data.Load(primaryID); !ok {
+			// 已被其他协程删除
+			return "", nil, nil, gorm.ErrRecordNotFound
+		}
 		// 删除缓存与索引
 		tableCache.data.Delete(primaryID)
 		tableCache.rowLocks.Delete(primaryID)
@@ -1215,6 +1285,23 @@ func (m *MysqlGts) DeleteFromCache(model interface{}, conds ...interface{}) (str
 
 	if len(toDelete) == 0 {
 		return "", nil, nil, gorm.ErrRecordNotFound
+	}
+
+	// 删除前：刷这些 id 相关操作日志，并对当前缓存对象 Save 一次兜底
+	if err := m.flushOperationLogsForIDs(tableName, toDelete); err != nil {
+		return "", nil, nil, err
+	}
+	for _, id := range toDelete {
+		rowLock := tableCache.getRowLock(id)
+		rowLock.RLock()
+		v, ok := tableCache.data.Load(id)
+		rowLock.RUnlock()
+		if !ok {
+			continue
+		}
+		if err := m.db.Save(v).Error; err != nil {
+			return "", nil, nil, err
+		}
 	}
 
 	// 获取所有要删除记录的行级锁（按顺序获取，避免死锁）
@@ -1571,6 +1658,54 @@ func (m *MysqlGts) getOrCreateOpLogQueue(tableName string) *tableOpLogQueue {
 	return val.(*tableOpLogQueue)
 }
 
+// flushOperationLogsForIDs 将指定 tableName 下、指定 id 集合相关的 OperationLog 从队列中摘出并立即入库。
+// 目的：在 DeleteFromCache 删除缓存前，尽量缩小“操作日志尚未入库但缓存已删除”的窗口，避免数据丢失。
+func (m *MysqlGts) flushOperationLogsForIDs(tableName string, ids []string) error {
+	if tableName == "" || len(ids) == 0 {
+		return nil
+	}
+	val, ok := m.opLogsMap.Load(tableName)
+	if !ok {
+		return nil
+	}
+	q := val.(*tableOpLogQueue)
+	want := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		want[id] = struct{}{}
+	}
+	if len(want) == 0 {
+		return nil
+	}
+
+	var toFlush []*OperationLog
+	q.mu.Lock()
+	if len(q.logs) > 0 {
+		keep := make([]*OperationLog, 0, len(q.logs))
+		for _, l := range q.logs {
+			if l == nil {
+				continue
+			}
+			if _, hit := want[l.ID]; hit {
+				toFlush = append(toFlush, l)
+				continue
+			}
+			keep = append(keep, l)
+		}
+		q.logs = keep
+	}
+	q.mu.Unlock()
+
+	for _, l := range toFlush {
+		if err := m.executeOperation(tableName, l); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // recordOperation 记录操作日志（只锁当前表队列，不占全局 m.mu，减少写竞争）
 func (m *MysqlGts) recordOperation(tableName, operation, id string, data interface{}) {
 	// 如果模型声明了 NotSyncToDatabase 且为 true，则不记录该模型的操作日志
@@ -1776,6 +1911,15 @@ func (m *MysqlGts) getFieldValue(model interface{}, fieldName string, tableCache
 		modelValue = modelValue.Elem()
 	}
 	camelName := m.toCamelCase(fieldName, tableCache)
+	// 优先使用缓存的字段索引，避免 FieldByName 反射查找
+	if tableCache != nil && tableCache.reflectInfo != nil && tableCache.reflectInfo.FieldMap != nil {
+		if idx, ok := tableCache.reflectInfo.FieldMap[camelName]; ok {
+			f := modelValue.Field(idx)
+			if f.IsValid() {
+				return fmt.Sprint(f.Interface())
+			}
+		}
+	}
 	field := modelValue.FieldByName(camelName)
 	if !field.IsValid() {
 		return ""
@@ -2141,15 +2285,6 @@ func containsSubstring(s, substr string) bool {
 	return false
 }
 
-// extractFieldName 从查询条件中提取字段名
-func extractFieldName(query string) string {
-	names := extractAllFieldNames(query)
-	if len(names) > 0 {
-		return names[0]
-	}
-	return ""
-}
-
 // extractAllFieldNames 从查询条件中提取所有字段名，支持 "api_type = ?"、"api_type =  ?"、"user_info_id = ? AND card_id = ?" 等
 func extractAllFieldNames(query string) []string {
 	// 先将连续空格合并为一个，便于统一匹配 " = ?" 或 "=?"
@@ -2418,42 +2553,48 @@ func (m *MysqlGts) GetTableStatus(tableName string) (loaded bool, recordCount in
 	return loaded, recordCount, pendingOps
 }
 
-// ClearCache 清空指定表的缓存（谨慎使用）
-func (m *MysqlGts) ClearCache(tableName string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// // ClearCache 清空指定表的缓存（谨慎使用）
+// func (m *MysqlGts) ClearCache(tableName string) error {
+// 	m.mu.Lock()
+// 	defer m.mu.Unlock()
 
-	tableCache, exists := m.tables[tableName]
-	if !exists {
-		return fmt.Errorf("表 %s 不存在", tableName)
-	}
+// 	tableCache, exists := m.tables[tableName]
+// 	if !exists {
+// 		return fmt.Errorf("表 %s 不存在", tableName)
+// 	}
 
-	tableCache.mu.Lock()
-	tableCache.loaded = false
-	tableCache.mu.Unlock()
+// 	tableCache.mu.Lock()
+// 	tableCache.loaded = false
+// 	tableCache.mu.Unlock()
 
-	// 清空 data
-	tableCache.data.Range(func(k, _ interface{}) bool {
-		tableCache.data.Delete(k)
-		return true
-	})
+// 	// 清空 data
+// 	tableCache.data.Range(func(k, _ interface{}) bool {
+// 		tableCache.data.Delete(k)
+// 		return true
+// 	})
 
-	// 清空联合二级索引及已索引字段记录
-	tableCache.index.Range(func(k, _ interface{}) bool {
-		tableCache.index.Delete(k)
-		return true
-	})
-	tableCache.indexReverse.Range(func(k, _ interface{}) bool {
-		tableCache.indexReverse.Delete(k)
-		return true
-	})
-	tableCache.indexedFields.Range(func(k, _ interface{}) bool {
-		tableCache.indexedFields.Delete(k)
-		return true
-	})
+// 	// 清空联合二级索引及已索引字段记录
+// 	tableCache.index.Range(func(k, _ interface{}) bool {
+// 		tableCache.index.Delete(k)
+// 		return true
+// 	})
+// 	tableCache.indexReverse.Range(func(k, _ interface{}) bool {
+// 		tableCache.indexReverse.Delete(k)
+// 		return true
+// 	})
+// 	tableCache.indexedFields.Range(func(k, _ interface{}) bool {
+// 		tableCache.indexedFields.Delete(k)
+// 		return true
+// 	})
 
-	return nil
-}
+// 	// 清空“全量索引构建版本”标记
+// 	tableCache.indexFullyBuiltFields.Range(func(k, _ interface{}) bool {
+// 		tableCache.indexFullyBuiltFields.Delete(k)
+// 		return true
+// 	})
+
+// 	return nil
+// }
 
 // 打印已经索引过的字段
 func (m *MysqlGts) DebugPrintIndexedFields(tableName string) {
@@ -2656,6 +2797,54 @@ func (m *MysqlGts) AdminFlushCacheRowsByUserInfoID(tableName string, userInfoID 
 		}
 		if err := m.db.Session(&gorm.Session{FullSaveAssociations: false}).Save(v).Error; err != nil {
 			jun_log.Error("AdminFlushCacheRowsByUserInfoID Save 失败", "tableName", tableName, "id", idStr, "error", err)
+			return true
+		}
+		saved++
+		return true
+	})
+	return saved, nil
+}
+
+// AdminRegisteredTableNames 返回当前 GTS 中已注册的全部表名（用于全表刷盘等）。
+func (m *MysqlGts) AdminRegisteredTableNames() []string {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]string, 0, len(m.tables))
+	for name := range m.tables {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// AdminFlushCacheTable 将该表 GTS 缓存中当前所有行用 GORM Save 写入数据库（GM 用）。
+func (m *MysqlGts) AdminFlushCacheTable(tableName string) (saved int, err error) {
+	if m == nil {
+		return 0, errors.New("Gts 未初始化")
+	}
+	m.mu.RLock()
+	tableCache, exists := m.tables[tableName]
+	m.mu.RUnlock()
+	if !exists {
+		return 0, fmt.Errorf("表 %s 未在 GTS 中注册", tableName)
+	}
+	tableCache.data.Range(func(idKey, val interface{}) bool {
+		idStr, ok := idKey.(string)
+		if !ok {
+			return true
+		}
+		rowLock := tableCache.getRowLock(idStr)
+		rowLock.RLock()
+		v, ok := tableCache.data.Load(idStr)
+		rowLock.RUnlock()
+		if !ok || v == nil {
+			return true
+		}
+		if err := m.db.Session(&gorm.Session{FullSaveAssociations: false}).Save(v).Error; err != nil {
+			jun_log.Error("AdminFlushCacheTable Save 失败", "tableName", tableName, "id", idStr, "error", err)
 			return true
 		}
 		saved++
