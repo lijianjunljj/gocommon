@@ -1155,6 +1155,40 @@ func (m *MysqlGts) UnLoadFromCache(model interface{}, conds ...interface{}) erro
 	return err
 }
 
+// EvictCacheRow 仅从 GTS 内存移除一行：不 flush 操作日志、不写库、不记同步日志。
+// 用于怪物等 NotSyncToDatabase 或仅需丢弃缓存的对象；缓存未加载或行不存在时返回 nil。
+func (m *MysqlGts) EvictCacheRow(model interface{}, primaryID string) error {
+	if m == nil || primaryID == "" {
+		return nil
+	}
+	tableName, err := m.getTableName(model)
+	if err != nil {
+		return err
+	}
+	m.mu.RLock()
+	tableCache, exists := m.tables[tableName]
+	m.mu.RUnlock()
+	if !exists {
+		return fmt.Errorf("表 %s 未初始化，请先调用 InitTable", tableName)
+	}
+	tableCache.mu.RLock()
+	loaded := tableCache.loaded
+	tableCache.mu.RUnlock()
+	if !loaded {
+		return nil
+	}
+	rowLock := tableCache.getRowLock(primaryID)
+	rowLock.Lock()
+	defer rowLock.Unlock()
+	if _, ok := tableCache.data.Load(primaryID); !ok {
+		return nil
+	}
+	tableCache.data.Delete(primaryID)
+	tableCache.rowLocks.Delete(primaryID)
+	m.indexRemoveId(tableCache, primaryID)
+	return nil
+}
+
 // Delete 删除记录
 func (m *MysqlGts) DeleteFromCache(model interface{}, conds ...interface{}) (string, []string, []interface{}, error) {
 	tableName, err := m.getTableName(model)
@@ -2795,6 +2829,10 @@ func (m *MysqlGts) AdminFlushCacheRowsByUserInfoID(tableName string, userInfoID 
 		if u2, ok2 := adminExtractUserInfoID(v); !ok2 || u2 != userInfoID {
 			return true
 		}
+		// 与 recordOperation 一致：匿名嵌入 gts.NotSyncToDatabase 且为 true 时不落库
+		if shouldSkipOperationLog(v) {
+			return true
+		}
 		if err := m.db.Session(&gorm.Session{FullSaveAssociations: false}).Save(v).Error; err != nil {
 			jun_log.Error("AdminFlushCacheRowsByUserInfoID Save 失败", "tableName", tableName, "id", idStr, "error", err)
 			return true
@@ -2841,6 +2879,10 @@ func (m *MysqlGts) AdminFlushCacheTable(tableName string) (saved int, err error)
 		v, ok := tableCache.data.Load(idStr)
 		rowLock.RUnlock()
 		if !ok || v == nil {
+			return true
+		}
+		// 与 recordOperation 一致：匿名嵌入 gts.NotSyncToDatabase 且为 true 时不落库
+		if shouldSkipOperationLog(v) {
 			return true
 		}
 		if err := m.db.Session(&gorm.Session{FullSaveAssociations: false}).Save(v).Error; err != nil {
