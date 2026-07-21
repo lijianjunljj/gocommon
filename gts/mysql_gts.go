@@ -1568,7 +1568,7 @@ func (m *MysqlGts) syncToDatabaseV2() {
 	for tn, logs := range batch {
 		wg.Add(1)
 		go func(tableName string, tableLogs []*OperationLog) {
-			jun_log.Debug("GTS syncToDatabaseV2 按表入库协程开始", "tableName", tableName, "tableLogs", len(tableLogs))
+			// jun_log.Debug("GTS syncToDatabaseV2 按表入库协程开始", "tableName", tableName, "tableLogs", len(tableLogs))
 			defer wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
@@ -1581,7 +1581,7 @@ func (m *MysqlGts) syncToDatabaseV2() {
 					jun_log.Error("执行操作日志到数据库失败", "tableName", tableName, "operationLog", operationLogString(log), "error", err)
 				}
 			}
-			jun_log.Debug("GTS syncToDatabaseV2 按表入库协程结束", "tableName", tableName, "tableLogs", len(tableLogs))
+			// jun_log.Debug("GTS syncToDatabaseV2 按表入库协程结束", "tableName", tableName, "tableLogs", len(tableLogs))
 		}(tn, logs)
 	}
 	wg.Wait()
